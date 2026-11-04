@@ -160,7 +160,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.0'
+    plugin_version = '2.1.1'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -181,6 +181,7 @@ class VarietyPilot(_PluginBase):
     _data_path: Optional[Path] = None
     _last_scan_at: float = 0.0
     _last_report: str = ''
+    _last_records: List[Dict[str, Any]] = []
     _scanning: bool = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -191,6 +192,7 @@ class VarietyPilot(_PluginBase):
         self._auto_shows = []
         self._sync_skipped = []
         self._config = dict(DEFAULT_CONFIG)
+        self._last_records = []
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ 配置
@@ -547,6 +549,7 @@ class VarietyPilot(_PluginBase):
         if sync_note:
             lines.append(sync_note)
         submitted = 0
+        collected: List[Dict[str, Any]] = []
         try:
             for show in targets:
                 try:
@@ -564,17 +567,20 @@ class VarietyPilot(_PluginBase):
                     dry_run=dry,
                 )
                 submitted += report.submitted
+                collected.extend(report.records)
                 lines.append(report.line())
-                for detail in report.details[:12]:
+                # 明细已按「失败 → 已提交 → 跳过」排好，失败原因排在最前
+                for detail in report.details[:20]:
                     lines.append(f'  · {detail}')
-                if len(report.details) > 12:
-                    lines.append(f'  · 其余 {len(report.details) - 12} 条明细请在插件页面查看')
+            if len(collected) > 20:
+                lines.append(f'每条资源的落位与原因共 {len(collected)} 条，见插件页面「最近扫描明细」')
             self._last_scan_at = time.time()
+            self._last_records = collected[-400:]
             self._last_report = '\n'.join(lines)
             summary = '\n'.join(lines)
             if _to_bool(self._config.get('notify'), True) and (submitted or not dry):
                 title = '【综艺衍生内容】预演结果' if dry else '【综艺衍生内容】已提交下载'
-                self.post_message(title=title, text=summary[:1500])
+                self.post_message(title=title, text=summary[:3000])
             return submitted, summary
         finally:
             with self._lock:
@@ -595,6 +601,16 @@ class VarietyPilot(_PluginBase):
     def _download(self, candidate: Candidate) -> Tuple[bool, str]:
         from app.chain.download import DownloadChain
 
+        # 先做本地预检：MP 的下载链要求上下文同时带种子、媒体、元数据三部分，
+        # 缺任何一项都会整体失败，且报错文案不区分是哪一项缺，先在这里说清楚。
+        context = candidate.context
+        missing = [
+            name for name in ('torrent_info', 'media_info', 'meta_info')
+            if getattr(context, name, None) is None
+        ]
+        if missing:
+            return False, f'下载上下文缺少 {"/".join(missing)}，无法提交'
+
         chain = DownloadChain()
         try:
             value = chain.download_single(
@@ -604,12 +620,19 @@ class VarietyPilot(_PluginBase):
             )
         except TypeError:
             value = chain.download_single(candidate.context)
+        except Exception as err:  # noqa: BLE001
+            logger.error(f'综艺衍生内容管家：提交下载异常《{candidate.title}》：{err}')
+            return False, f'调用下载接口异常：{err}'
         if isinstance(value, tuple):
             download_hash = value[0] if value else None
             message = value[1] if len(value) > 1 else ''
             if download_hash:
                 return True, str(download_hash)
-            return False, str(message or '下载器未返回任务标识')
+            return False, str(
+                message
+                or '下载器未接受该资源且未返回原因（常见于站点种子获取失败、'
+                   '未配置下载目录，或该种子已被 MP 记入下载失败黑名单）'
+            )
         if value:
             return True, str(value)
         return False, '下载器未返回任务标识'
@@ -890,6 +913,19 @@ class VarietyPilot(_PluginBase):
             'success': True,
             'message': f'已开始扫描{scope}，完成后可在插件页查看结果',
             'data': {'started': True},
+        }
+
+    def api_records(self, limit: int = 200) -> Dict[str, Any]:
+        """返回最近一次扫描的逐条明细，按「失败 → 跳过 → 等待 → 已提交」排序。"""
+        order = {'失败': 0, '跳过': 1, '等待': 2, '待提交': 3, '预演': 4, '已提交': 5}
+        items = sorted(
+            self._last_records,
+            key=lambda item: order.get(str(item.get('status') or ''), 9),
+        )
+        return {
+            'success': True,
+            'message': f'共 {len(items)} 条明细',
+            'data': items[: max(1, limit)],
         }
 
     def api_tasks(self, limit: int = 100) -> Dict[str, Any]:
@@ -1335,8 +1371,112 @@ class VarietyPilot(_PluginBase):
                 ],
             },
             self._card('上次扫描结果', [('', self._last_report or '尚未执行扫描')]),
+            self._records_card(),
             self._site_card(),
         ]
+
+    def _records_card(self) -> dict:
+        """逐条列出每条资源的落位、得分和去向，避免「明细无处可查」。"""
+        title = '最近扫描明细'
+        if not self._last_records:
+            return {
+                'component': 'VCard',
+                'props': {'class': 'mb-3', 'variant': 'outlined'},
+                'content': [
+                    {'component': 'VCardTitle', 'text': title},
+                    {
+                        'component': 'VCardText',
+                        'content': [
+                            {
+                                'component': 'VAlert',
+                                'props': {
+                                    'type': 'info',
+                                    'variant': 'tonal',
+                                    'density': 'compact',
+                                    'text': '尚未扫描。执行一次扫描后，这里会按「失败 → 跳过 → 等待 → 已提交」列出每一条资源。',
+                                },
+                            }
+                        ],
+                    },
+                ],
+            }
+
+        counts: Dict[str, int] = {}
+        for record in self._last_records:
+            status = str(record.get('status') or '未知')
+            counts[status] = counts.get(status, 0) + 1
+        summary = ' ｜ '.join(f'{status} {count}' for status, count in counts.items())
+        order = {'失败': 0, '跳过': 1, '等待': 2, '待提交': 3, '预演': 4, '已提交': 5}
+        ordered = sorted(
+            self._last_records,
+            key=lambda item: order.get(str(item.get('status') or ''), 9),
+        )
+        shown = ordered[:150]
+        content: List[dict] = [
+            {
+                'component': 'VAlert',
+                'props': {
+                    'type': 'warning' if counts.get('失败') else 'info',
+                    'variant': 'tonal',
+                    'density': 'compact',
+                    'class': 'mb-2',
+                    'text': f'共 {len(self._last_records)} 条 ｜ {summary}',
+                },
+            }
+        ]
+        for record in shown:
+            status = str(record.get('status') or '')
+            reason = str(record.get('reason') or '')
+            target = str(record.get('target') or '-')
+            sxx_name = str(record.get('sxx_name') or '')
+            head = f'{status} ｜ {target} ← {record.get("src") or "-"} ｜ {str(record.get("title") or "")[:80]}'
+            tail = (
+                f'得分 {record.get("score")} ｜ {record.get("size_gb")}GB ｜ '
+                f'做种 {record.get("seeders")}'
+            )
+            if sxx_name:
+                tail += f' ｜ TMDB：{sxx_name}'
+            if reason:
+                tail += f' ｜ {reason}'
+            content.append(
+                {
+                    'component': 'VListItem',
+                    'props': {'density': 'compact'},
+                    'content': [
+                        {
+                            'component': 'VListItemTitle',
+                            'props': {'class': 'text-body-2'},
+                            'text': head,
+                        },
+                        {
+                            'component': 'VListItemSubtitle',
+                            'props': {'class': 'text-caption'},
+                            'text': tail,
+                        },
+                    ],
+                }
+            )
+        if len(ordered) > len(shown):
+            content.append(
+                {
+                    'component': 'VAlert',
+                    'props': {
+                        'type': 'info',
+                        'variant': 'tonal',
+                        'density': 'compact',
+                        'class': 'mt-2',
+                        'text': f'仅显示前 {len(shown)} 条，完整 {len(ordered)} 条可通过插件接口 /scan 结果获取。',
+                    },
+                }
+            )
+        return {
+            'component': 'VCard',
+            'props': {'class': 'mb-3', 'variant': 'outlined'},
+            'content': [
+                {'component': 'VCardTitle', 'text': title},
+                {'component': 'VCardText', 'content': content},
+            ],
+        }
 
     def _sync_card(self) -> dict:
         """订阅同步状态：让用户看得见「同步到了什么、为什么少了几部」。"""

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
@@ -32,6 +33,8 @@ SCORE_SUBTYPE_NEAR = 1.0
 SCORE_MODIFIER_HIT = 2.0
 SCORE_MODIFIER_MISS = 1.5
 SCORE_PART_HIT = 1.0
+SCORE_SEGMENT_HIT = 4.0
+SCORE_SEGMENT_NEAR = 2.0
 SCORE_DATE_EXACT = 2.0
 SCORE_DATE_NEAR = 1.5
 SCORE_DATE_FAR = 1.0
@@ -66,6 +69,7 @@ class SpecialEpisode:
     modifier: Optional[str] = None
     part: Optional[str] = None
     year: Optional[int] = None
+    segment: Optional[str] = None     # 集名「·」后的片段名，如「小画家」
 
     def __post_init__(self) -> None:
         parsed = parse_title(self.name)
@@ -75,6 +79,7 @@ class SpecialEpisode:
         self.modifier = parsed.modifier
         self.part = parsed.part
         self.year = parsed.year
+        self.segment = parsed.segment
 
 
 @dataclass(slots=True)
@@ -139,6 +144,7 @@ class SpecialIndex:
             episode.modifier = item.get('modifier')
             episode.part = item.get('part')
             episode.year = item.get('year')
+            episode.segment = item.get('segment')
             episodes.append(episode)
         return cls(
             tmdb_id=int(data.get('tmdb_id') or 0),
@@ -359,6 +365,39 @@ def _date_gap(left: Optional[date], right: Optional[date]) -> Optional[int]:
     return abs((left - right).days)
 
 
+_PUNCT_RE = re.compile(r'[\s·・,，。.、:：;；!！?？\-_/\\|()（）\[\]【】"“”\'‘’]+')
+
+
+def _norm_segment(text: Optional[str]) -> str:
+    """归一化片段名：去标点空格，只留可用于比对的字符。"""
+    if not text:
+        return ''
+    return _PUNCT_RE.sub('', text).lower()
+
+
+def _segment_score(left: Optional[str], right: Optional[str]) -> tuple[float, str]:
+    """比较两条片段名，返回 (分数, 说明)。
+
+    站点副标题常被截断（末尾省略号），所以用包含关系判断，
+    再退到二元组重合度，避免「小画家」和「小画师」被误判成同一段。
+    """
+    a, b = _norm_segment(left), _norm_segment(right)
+    if len(a) < 2 or len(b) < 2:
+        return 0.0, ''
+    if a == b:
+        return SCORE_SEGMENT_HIT, f'片段名一致（{right}）'
+    if a in b or b in a:
+        return SCORE_SEGMENT_HIT, f'片段名吻合（{right} 含 {left}）'
+    grams_a = {a[i:i + 2] for i in range(len(a) - 1)}
+    grams_b = {b[i:i + 2] for i in range(len(b) - 1)}
+    if not grams_a or not grams_b:
+        return 0.0, ''
+    overlap = len(grams_a & grams_b) / len(grams_a | grams_b)
+    if overlap >= 0.5:
+        return SCORE_SEGMENT_NEAR, f'片段名相似 {overlap:.0%}'
+    return -SCORE_SEGMENT_NEAR, f'片段名不同（{left}≠{right}）'
+
+
 def score_episode(
     target: ParsedTitle,
     candidate: SpecialEpisode,
@@ -397,13 +436,16 @@ def score_episode(
             score -= SCORE_YEAR_MISS
             reasons.append(f'年份不符 {target.year}≠{candidate.year}')
 
-    # 期号维度
-    if target.episode is not None and candidate.period is not None:
+    # 期号维度：只认「真实期号」。站点 SxxExx 往往只是发布序号
+    # （同一期的正片、加更、纯享片段各占一个 E 号），拿去比 TMDB 的「第X期」必然错位。
+    if target.episode is not None and candidate.period is not None and not target.episode_is_site_ordinal:
         if target.episode == candidate.period:
             score += SCORE_EPISODE_HIT
             reasons.append(f'期号一致 第{target.episode}期')
         else:
             return MatchResult(episode=candidate.episode, name=candidate.name, score=-99.0, reasons=['期号不符'])
+    elif target.episode_is_site_ordinal and candidate.period is not None:
+        reasons.append(f'站点序号 E{target.episode}（不作期号）')
 
     # 类型维度
     if target.subtype and candidate.subtype:
@@ -442,6 +484,16 @@ def score_episode(
         else:
             score -= SCORE_PART_HIT
             reasons.append(f'分P不符（{target.part}≠{candidate.part}）')
+    elif target.part and not candidate.part:
+        score -= SCORE_PART_HIT
+        reasons.append('候选项未标分P')
+
+    # 片段名：同一期拆成多个纯享片段时，只有这一层能区分
+    if target.segment and candidate.segment:
+        delta, note = _segment_score(target.segment, candidate.segment)
+        if delta or note:
+            score += delta
+            reasons.append(note)
 
     # 日期兜底：越接近分数越高
     gap = _date_gap(target_date or target.air_date, _parse_date(candidate.air_date))
@@ -465,6 +517,36 @@ def score_episode(
     )
 
 
+def rank_specials(
+    target: ParsedTitle,
+    index: SpecialIndex,
+    air_date: Optional[date] = None,
+    limit: int = 8,
+) -> list[MatchResult]:
+    """返回按分数降序的候选集列表，供落位环节挑一个没被占用的集号。
+
+    只返回达到最低门槛的结果；分数相近的若干条都会保留，
+    因为同一期往往有多个片段集，单看一条资源的信号分不出是哪一段。
+    """
+    if not index.episodes:
+        return []
+    scored = [score_episode(target, episode, index, target_date=air_date) for episode in index.episodes]
+    scored = [item for item in scored if item.score > -50]
+    if not scored:
+        return []
+    scored.sort(key=lambda item: (item.score, -item.episode), reverse=True)
+
+    best_score = scored[0].score
+    floor = MIN_ACCEPT_SCORE
+    # 期号不可用（站点序号）或标题信息很少时，信号本就少，门槛相应放宽，
+    # 剩下的交给「一条资源落一个集号」的顺序分配去纠偏。
+    if target.episode is None or target.episode_is_site_ordinal:
+        floor -= 1.0
+    # 保留与最佳结果相差不超过 3 分的候选：同一期的多个片段通常就落在这一档里
+    keep = [item for item in scored if item.score >= max(floor, best_score - 3.0)]
+    return keep[:limit]
+
+
 def match_special(
     target: ParsedTitle,
     index: SpecialIndex,
@@ -477,27 +559,11 @@ def match_special(
     :param air_date: 调用方已知的播出日期，用于补充打分
     :return: 最高分且达到阈值的匹配；无合适结果时返回 None
     """
-    if not index.episodes:
+    ranked = rank_specials(target, index, air_date=air_date, limit=1)
+    if not ranked:
+        logger.debug(f'综艺衍生季匹配：{target.raw!r} 没有达到门槛的候选')
         return None
-
-    scored = [score_episode(target, episode, index, target_date=air_date) for episode in index.episodes]
-    scored = [item for item in scored if item.score > -50]
-    if not scored:
-        return None
-    best = max(scored, key=lambda item: (item.score, -item.episode))
-
-    # 标题既无期号也无日期时可用信号很少（如「第3季 先导片上」），
-    # 此时「季一致 + 类型一致」已经足以定位，适当放宽阈值。
-    threshold = MIN_ACCEPT_SCORE
-    if target.episode is None and target.air_date is None:
-        threshold = MIN_ACCEPT_SCORE - 1.0
-    if best.score < threshold:
-        logger.debug(
-            f'综艺衍生季匹配：{target.raw!r} 最高分 {best.score:.1f} 未达阈值 '
-            f'{threshold}，候选 {best.name!r}'
-        )
-        return None
-    return best
+    return ranked[0]
 
 
 def match_for_title(

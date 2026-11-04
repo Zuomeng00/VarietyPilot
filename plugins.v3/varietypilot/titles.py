@@ -105,7 +105,14 @@ _RE_DATE_FULL = re.compile(r'(?<!\d)(20\d{2})[.\-_/年]?(\d{1,2})[.\-_/月]?(\d{
 _RE_DATE_MD = re.compile(r'(?<![\d.])(\d{1,2})[.\-_/月](\d{1,2})(?![\d.])日?')
 
 # 分P
-_RE_PART = re.compile(r'(?:(?<=[\s.\-_\]】）])|^)(上|下)(?:集|篇|部)?(?=$|[\s.\-_\[\]【（(])')
+_RE_PART = re.compile(
+    r'(?:(?<=[\s.\-_\]】）期集0-9])|^)(上|下)(?:集|篇|部)?'
+    r'(?=$|[\s.\-_\[\]【（(：:·])'
+)
+# 「第4期上纯享」「第4期下加更」：上/下直接黏在类型词前，中间没有分隔符
+_RE_PART_BEFORE_SUBTYPE = re.compile(
+    r'(?<=[期集0-9])(上|下)(?=(?:纯享|加更|彩蛋|特辑|花絮|精编|精华|会员|先导|超前|直拍|加料|未播))'
+)
 _RE_PART_CN = re.compile(r'第?\s*([一二三四五六七八九十])\s*(?:部分|部)')
 _RE_PART_EN = re.compile(r'(?:part|pt)\s*([12])(?!\d)', re.IGNORECASE)
 
@@ -114,6 +121,14 @@ _RE_ANY_SEASON_EPISODE = _RE_SEASON_EPISODE
 
 # 站点副标题里明确标正片，用于把「正片」与「加更」区分开
 _RE_FEATURE = re.compile(r'正片')
+
+# 片段名：副标题冒号后的内容（「第04期加更：白敬亭林一…」），
+# 或 TMDB 集名里「·」后的内容（「第4季 第4期下纯享·小画家」）。
+# 同一期的多个纯享片段只有这一层信息能区分开，是精确落位的最后手段。
+_RE_SEGMENT_COLON = re.compile(r'[：:]\s*(.+)$')
+_RE_SEGMENT_DOT = re.compile(r'[·・]\s*(.+)$')
+# 省略号/尾部标点会污染比对
+_RE_TRAILING_DOTS = re.compile(r'[….．\s]+$')
 
 # 一次性特别内容：没有「第X期」的概念，站点集号只是发布序号
 ONE_OFF_SUBTYPES = frozenset({'special', 'bonus', 'prequel', 'live', 'clip'})
@@ -175,7 +190,17 @@ class ParsedTitle:
     air_date: Optional[date] = None
     is_pack: bool = False          # 整季包（无单集集号）
     is_single_episode: bool = False
+    # 期号来源：site（站点 SxxExx）/ title（标题里的第X期）/ desc（副标题里的第X期）。
+    # 站点编号可能只是发布序号，不能当期号用，匹配时要区别对待。
+    episode_source: str = ''
+    # 片段名，如「小画家」「白敬亭林一雷霆画功」，用于区分同期的多个纯享片段
+    segment: Optional[str] = None
     signals: list[str] = field(default_factory=list)
+
+    @property
+    def episode_is_site_ordinal(self) -> bool:
+        """期号是否只是站点发布序号（不是节目真实期号）。"""
+        return self.episode_source == 'site'
 
     @property
     def is_derived(self) -> bool:
@@ -222,14 +247,45 @@ def _extract_part(text: str) -> Optional[str]:
     if m := _RE_PART_CN.search(text):
         value = cn_to_int(m.group(1))
         return {1: '上', 2: '中', 3: '下'}.get(value or 0)
+    if m := _RE_PART_BEFORE_SUBTYPE.search(text):
+        return m.group(1)
     # 「上/下」必须贴近类型词或位于结尾，避免「上海」这类误判
     for m in _RE_PART.finditer(text):
         tail = text[m.end():].strip(' .-_')
         if not tail:
             return m.group(1)
+        # 形如「第4期下：小画家」：分P后面直接接片段名
+        if tail[:1] in '：:·|':
+            return m.group(1)
         # 形如「第1期.上.加更」：后面紧跟类型词时也算分P
         if len(tail) <= 8 and detect_subtype(tail)[0]:
             return m.group(1)
+        # 形如「第4期上纯享·不眨眼唱歌」：类型词紧跟其后，片段名再长也不影响
+        if detect_subtype(tail[:6])[0]:
+            return m.group(1)
+    return None
+
+
+def _extract_segment(text: str) -> Optional[str]:
+    """提取片段名。
+
+    副标题形如「现在就出发 第四季 加更 第04期还有加更：白敬亭林一雷霆画功…」，
+    冒号后是这一条衍生内容的片段名；TMDB 集名形如「第4季 第4期下纯享·小画家」，
+    「·」后是同一个片段名。两者对上，说明就是同一段视频。
+    """
+    for pattern in (_RE_SEGMENT_COLON, _RE_SEGMENT_DOT):
+        m = pattern.search(text)
+        if not m:
+            continue
+        # 冒号前必须已经出现期号或类型词，否则那是剧名自带的分隔符
+        # （如「现在就出发：第四季 第04期加更」），不是片段名
+        if pattern is _RE_SEGMENT_COLON:
+            prefix = text[:m.start()]
+            if not (_RE_EPISODE_CN.search(prefix) or detect_subtype(prefix)[0]):
+                continue
+        value = _RE_TRAILING_DOTS.sub('', m.group(1)).strip(' -_|')
+        if len(value) >= 2:
+            return value
     return None
 
 
@@ -264,6 +320,7 @@ def parse_title(title: str) -> ParsedTitle:
         parsed.site_episode = int(m.group(2))
         parsed.season = parsed.site_season
         parsed.episode = parsed.site_episode
+        parsed.episode_source = 'site'
         parsed.is_single_episode = True
         parsed.signals.append('SxxExx')
 
@@ -277,14 +334,16 @@ def parse_title(title: str) -> ParsedTitle:
             parsed.season = int(m.group(1))
             parsed.signals.append('Sxx')
 
-    # 期号
+    # 期号：标题里写明的「第X期」才是真实期号，优先级高于站点 SxxExx
     if m := _RE_EPISODE_CN.search(text):
         if (value := cn_to_int(m.group(1))) is not None:
             parsed.episode = value
+            parsed.episode_source = 'title'
             parsed.signals.append('第X期')
     elif parsed.episode is None:
         if m := _RE_EPISODE_EP.search(text):
             parsed.episode = int(m.group(1))
+            parsed.episode_source = 'title'
             parsed.signals.append('EPx')
 
     # 年份与日期
@@ -305,6 +364,9 @@ def parse_title(title: str) -> ParsedTitle:
 
     # 分P
     parsed.part = _extract_part(text)
+
+    # 片段名
+    parsed.segment = _extract_segment(text)
 
     # 整季包判定：有季号无期号、且标题无集号
     parsed.is_pack = parsed.season is not None and parsed.episode is None and not parsed.is_single_episode
@@ -347,6 +409,7 @@ def parse_release(title: str, description: str = '') -> ParsedTitle:
 
     if extra.episode is not None:
         parsed.episode = extra.episode
+        parsed.episode_source = 'desc'
         parsed.signals.append('副标题:期号')
     if extra.season is not None:
         parsed.season = extra.season
@@ -359,6 +422,10 @@ def parse_release(title: str, description: str = '') -> ParsedTitle:
         parsed.modifier = extra.modifier
     if extra.part and not parsed.part:
         parsed.part = extra.part
+    # 副标题的片段名比资源名可靠：资源名里没有片段信息
+    if extra.segment:
+        parsed.segment = extra.segment
+        parsed.signals.append('副标题:片段名')
     if parsed.air_date is None and extra.air_date:
         parsed.air_date = extra.air_date
     if parsed.year is None and extra.year:
@@ -376,6 +443,7 @@ def parse_release(title: str, description: str = '') -> ParsedTitle:
     # 站点 E02 只是发布序号，拿去和 TMDB 的「第X期」比必然错位。
     if extra.episode is None and parsed.subtype in ONE_OFF_SUBTYPES:
         parsed.episode = None
+        parsed.episode_source = ''
         parsed.signals.append('一次性特别:不采用站点集号')
 
     parsed.raw = f'{title} || {description}'
