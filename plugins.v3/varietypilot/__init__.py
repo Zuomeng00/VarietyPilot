@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -85,6 +86,7 @@ from .store import (
     TaskStore,
 )
 from .sxxindex import SpecialIndexStore
+from .subscribes import TmdbGenreChecker, VarietyCache, collect, list_tv_subscriptions
 from .titles import parse_title
 
 logger = logging.getLogger(__name__)
@@ -95,7 +97,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'enabled': False,
     'shows': '',
     'cron': '*/30 * * * *',
-    'site_ids': '',
+    'site_ids': [],
+    'sync_subscribe': True,
+    'sync_scope': 'variety',
+    'sync_exclude': '',
     'min_seeders': 1,
     'min_size_gb': 0.05,
     'max_size_gb': 20.0,
@@ -153,9 +158,9 @@ def _normalize_title(name: str) -> str:
 class VarietyPilot(_PluginBase):
     # ---- 插件元信息
     plugin_name = '综艺衍生内容管家'
-    plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，不占正片集号，极影视与 Emby 均可正常入库。'
+    plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.0.0'
+    plugin_version = '2.1.0'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -166,6 +171,11 @@ class VarietyPilot(_PluginBase):
     _enabled: bool = False
     _config: Dict[str, Any]
     _shows: List[TrackedShow]
+    _manual_shows: List[TrackedShow]
+    _auto_shows: List[TrackedShow]
+    _sync_at: float = 0.0
+    _sync_error: str = ''
+    _sync_skipped: List[str]
     _store: Optional[TaskStore] = None
     _index_store: Optional[SpecialIndexStore] = None
     _data_path: Optional[Path] = None
@@ -177,6 +187,9 @@ class VarietyPilot(_PluginBase):
         super().__init__()
         self._options = Options()
         self._shows = []
+        self._manual_shows = []
+        self._auto_shows = []
+        self._sync_skipped = []
         self._config = dict(DEFAULT_CONFIG)
         self._lock = threading.RLock()
 
@@ -197,7 +210,11 @@ class VarietyPilot(_PluginBase):
             prefer_resolution=str(merged.get('prefer_resolution') or '1080p'),
             overwrite_existing=_to_bool(merged.get('overwrite_existing')),
         )
-        self._shows = self._parse_shows(str(merged.get('shows') or ''), str(merged.get('site_ids') or ''))
+        self._manual_shows = self._parse_shows(
+            str(merged.get('shows') or ''), merged.get('site_ids')
+        )
+        self._auto_shows = []
+        self._sync_skipped = []
 
         try:
             self._data_path = self.get_data_path()
@@ -211,19 +228,40 @@ class VarietyPilot(_PluginBase):
                 cache_dir=self._data_path / 'sxx',
                 ttl_seconds=_to_int(merged.get('index_ttl_hours'), 12) * 3600,
             )
+            # 订阅同步结果落盘，重启后先按缓存生效，不必等到下一轮扫描
+            self._load_auto_shows()
+
+        self._rebuild_shows()
         logger.info(
             f'综艺衍生内容管家：配置已生效，状态={"启用" if self._enabled else "停用"}，'
-            f'跟踪 {len(self._shows)} 部剧，预演={"开" if _to_bool(merged.get("dry_run"), True) else "关"}'
+            f'手动 {len(self._manual_shows)} 部 / 订阅 {len(self._auto_shows)} 部，'
+            f'预演={"开" if _to_bool(merged.get("dry_run"), True) else "关"}'
         )
+        if self._enabled and _to_bool(merged.get('sync_subscribe'), True):
+            self._schedule_first_sync()
 
     def get_state(self) -> bool:
         return bool(self._enabled)
 
     @staticmethod
-    def _parse_shows(text: str, site_text: str) -> List[TrackedShow]:
+    def _parse_site_ids(raw: Any) -> List[int]:
+        """站点配置既可能是多选返回的数组，也可能是旧版逗号字符串。"""
+        if isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = str(raw or '').replace('，', ',').split(',')
+        sites: List[int] = []
+        for item in values:
+            value = _to_int(str(item).strip(), 0)
+            if value > 0 and value not in sites:
+                sites.append(value)
+        return sites
+
+    @classmethod
+    def _parse_shows(cls, text: str, site_raw: Any) -> List[TrackedShow]:
         """解析剧列表，每行 `剧名|TMDBID|年份`, 每行 `剧名|TMDBID|别名1,别名2` 也可用。"""
         shows: List[TrackedShow] = []
-        sites = [_to_int(item, 0) for item in (site_text or '').split(',') if _to_int(item, 0) > 0]
+        sites = cls._parse_site_ids(site_raw)
         for raw in (text or '').splitlines():
             line = raw.strip()
             if not line or line.startswith('#'):
@@ -250,6 +288,178 @@ class VarietyPilot(_PluginBase):
             shows.append(TrackedShow(name=name, tmdb_id=tmdb_id, year=year, aliases=aliases, sites=sites))
         return shows
 
+    def _configured_site_ids(self) -> List[int]:
+        """当前配置里填写的站点 ID，去重保序。"""
+        return self._parse_site_ids(self._config.get('site_ids'))
+
+    # -------------------------------------------------------------- 订阅同步
+
+    def _auto_cache_file(self) -> Optional[Path]:
+        if not self._data_path:
+            return None
+        return self._data_path / 'auto_shows.json'
+
+    def _load_auto_shows(self) -> None:
+        """恢复上次同步出的订阅剧集，重启后立刻可用，不必等网络。"""
+        if not _to_bool(self._config.get('sync_subscribe'), True):
+            return
+        path = self._auto_cache_file()
+        if path is None or not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as err:
+            logger.debug(f'综艺衍生内容管家：订阅缓存损坏已丢弃：{err}')
+            return
+        if not isinstance(raw, dict):
+            return
+        sites = self._configured_site_ids()
+        shows: List[TrackedShow] = []
+        for item in raw.get('shows') or []:
+            if not isinstance(item, dict):
+                continue
+            tmdb_id = _to_int(item.get('tmdb_id'), 0)
+            name = str(item.get('name') or '').strip()
+            if tmdb_id <= 0 or not name:
+                continue
+            shows.append(
+                TrackedShow(
+                    name=name,
+                    tmdb_id=tmdb_id,
+                    year=str(item.get('year') or ''),
+                    sites=sites,
+                )
+            )
+        self._auto_shows = shows
+        self._sync_at = _to_float(raw.get('at'), 0.0)
+        self._sync_skipped = [str(item) for item in (raw.get('skipped') or []) if item]
+
+    def _save_auto_shows(self) -> None:
+        path = self._auto_cache_file()
+        if path is None:
+            return
+        payload = {
+            'at': self._sync_at,
+            'skipped': self._sync_skipped,
+            'shows': [
+                {'tmdb_id': show.tmdb_id, 'name': show.name, 'year': show.year}
+                for show in self._auto_shows
+            ],
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding='utf-8')
+        except OSError as err:
+            logger.debug(f'综艺衍生内容管家：订阅缓存写入失败：{err}')
+
+    def _rebuild_shows(self) -> None:
+        """手动配置优先，同一部剧不会被订阅同步重复加入。"""
+        merged: List[TrackedShow] = []
+        seen: set[int] = set()
+        for show in [*self._manual_shows, *self._auto_shows]:
+            if show.tmdb_id in seen:
+                continue
+            seen.add(show.tmdb_id)
+            merged.append(show)
+        with self._lock:
+            self._shows = merged
+
+    def refresh_subscriptions(self) -> Tuple[int, str]:
+        """从 MP 现有订阅里同步综艺，返回 (新增/更新数量, 说明)。
+
+        只在扫描线程里调用，页面渲染不触发网络。
+        """
+        if not _to_bool(self._config.get('sync_subscribe'), True):
+            if self._auto_shows:
+                self._auto_shows = []
+                self._sync_at = 0.0
+                self._sync_skipped = []
+                self._save_auto_shows()
+                self._rebuild_shows()
+            return 0, '未开启订阅同步'
+
+        raw_exclude = str(self._config.get('sync_exclude') or '')
+        exclude_ids = self._parse_site_ids(raw_exclude)
+        scope = str(self._config.get('sync_scope') or 'variety')
+
+        items = list_tv_subscriptions()
+        if not items:
+            return 0, '没有读取到电视剧订阅（或当前账号无订阅权限）'
+
+        cache_file = (self._data_path / 'genre_cache.json') if self._data_path else None
+        checker = TmdbGenreChecker(VarietyCache(cache_file)) if cache_file else None
+        found, skipped = collect(
+            items,
+            is_variety=checker if checker else None,
+            exclude_ids=exclude_ids,
+            scope=scope,
+        )
+        if checker:
+            checker.save()
+
+        sites = self._configured_site_ids()
+        self._auto_shows = [
+            TrackedShow(name=row.name, tmdb_id=row.tmdb_id, year=row.year, sites=sites)
+            for row in found
+        ]
+        self._sync_at = time.time()
+        self._sync_skipped = skipped
+        self._sync_error = ''
+        self._save_auto_shows()
+        self._rebuild_shows()
+        note = f'订阅同步完成：{len(self._auto_shows)} 部'
+        if skipped:
+            note += f'，{len(skipped)} 部类型未知已跳过'
+        return len(self._auto_shows), note
+
+    @staticmethod
+    def site_catalog() -> List[Dict[str, Any]]:
+        """列出宿主已接入的站点，供填写「限定站点 ID」时对照。
+
+        读的是宿主站点库，不改任何数据；取不到时返回空列表，
+        页面只会少一块内容，不影响其他功能。
+        """
+        try:
+            from app.sdk.network import SitesHelper
+
+            indexers = SitesHelper().get_indexers() or []
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f'综艺衍生内容管家：读取站点列表失败：{err}')
+            return []
+        catalog: List[Dict[str, Any]] = []
+        for item in indexers:
+            if not isinstance(item, dict):
+                continue
+            site_id = _to_int(item.get('id'), 0)
+            if site_id <= 0:
+                continue
+            catalog.append(
+                {
+                    'id': site_id,
+                    'name': str(item.get('name') or ''),
+                    'domain': str(item.get('domain') or ''),
+                    'public': bool(item.get('public')),
+                }
+            )
+        catalog.sort(key=lambda row: (row['public'], row['id']))
+        return catalog
+
+    def _site_warnings(self) -> List[str]:
+        """配置了但站点库里找不到的 ID，MP 会静默按「全部站点」处理，必须提示出来。"""
+        wanted = self._configured_site_ids()
+        if not wanted:
+            return []
+        catalog = {row['id']: row for row in self.site_catalog()}
+        if not catalog:
+            return []
+        missing = [str(site_id) for site_id in wanted if site_id not in catalog]
+        if not missing:
+            return []
+        return [
+            f'站点 ID {", ".join(missing)} 在当前站点库里不存在或未启用，'
+            f'MP 会按「全部站点」搜索。请核对后修正，或清空此项。'
+        ]
+
     # ------------------------------------------------------------------- 服务
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -273,6 +483,30 @@ class VarietyPilot(_PluginBase):
             }
         ]
 
+    def _schedule_first_sync(self) -> None:
+        """启动后补一次订阅同步，避免要等满一个扫描周期才看到订阅的剧。"""
+        try:
+            from app.sdk.scheduler import add_plugin_once_job
+
+            add_plugin_once_job(
+                plugin_id=PLUGIN_ID,
+                job_id='first_sync',
+                func=self._first_sync,
+                name='综艺衍生内容-订阅同步',
+                delay_seconds=90,
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f'综艺衍生内容管家：初始订阅同步注册失败：{err}')
+
+    def _first_sync(self) -> None:
+        if not self._enabled:
+            return
+        try:
+            count, note = self.refresh_subscriptions()
+            logger.info(f'综艺衍生内容管家：{note}')
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f'综艺衍生内容管家：初始订阅同步失败：{err}')
+
     def stop_service(self) -> None:
         """释放扫描状态。插件不建自建线程，无需额外回收。"""
         self._scanning = False
@@ -289,8 +523,17 @@ class VarietyPilot(_PluginBase):
         """执行一轮扫描，返回 (提交数量, 文本汇总)。"""
         if self._store is None or self._index_store is None:
             return 0, '插件尚未初始化，请先保存配置'
+
+        sync_note = ''
+        if _to_bool(self._config.get('sync_subscribe'), True):
+            try:
+                _, sync_note = self.refresh_subscriptions()
+            except Exception as err:  # noqa: BLE001
+                sync_note = f'订阅同步失败：{err}'
+                logger.warning(f'综艺衍生内容管家：{sync_note}')
+
         if not self._shows:
-            return 0, '未配置跟踪剧集，请在插件设置里填写「剧名|TMDB ID」'
+            return 0, sync_note or '未配置跟踪剧集，请在插件设置里填写「剧名|TMDB ID」'
 
         dry = _to_bool(self._config.get('dry_run'), True) if dry_run is None else dry_run
         targets = [show for show in self._shows if not only_show or show.name == only_show]
@@ -300,6 +543,9 @@ class VarietyPilot(_PluginBase):
         with self._lock:
             self._scanning = True
         lines: List[str] = []
+        lines.extend(self._site_warnings())
+        if sync_note:
+            lines.append(sync_note)
         submitted = 0
         try:
             for show in targets:
@@ -577,7 +823,50 @@ class VarietyPilot(_PluginBase):
                 'summary': '清理记录',
                 'description': '清理已完成或指定状态的记录',
             },
+            {
+                'path': '/sites',
+                'endpoint': self.api_sites,
+                'methods': ['GET'],
+                'auth': 'bear',
+                'summary': '可用站点 ID',
+                'description': '列出宿主已接入的站点及其数字 ID，用于填写「限定站点 ID」',
+            },
+            {
+                'path': '/sync',
+                'endpoint': self.api_sync,
+                'methods': ['POST'],
+                'auth': 'bear',
+                'summary': '立即同步订阅',
+                'description': '从 MP 现有电视剧订阅中重新识别综艺并刷新跟踪列表',
+            },
         ]
+
+    def api_sync(self) -> Dict[str, Any]:
+        try:
+            count, note = self.refresh_subscriptions()
+        except Exception as err:  # noqa: BLE001
+            self._sync_error = str(err)
+            return {'success': False, 'message': f'同步失败：{err}', 'data': {}}
+        return {
+            'success': True,
+            'message': note,
+            'data': {
+                'auto': count,
+                'manual': len(self._manual_shows),
+                'shows': [
+                    {'name': show.name, 'tmdb_id': show.tmdb_id} for show in self._shows
+                ],
+            },
+        }
+
+    def api_sites(self) -> Dict[str, Any]:
+        catalog = self.site_catalog()
+        wanted = self._configured_site_ids()
+        return {
+            'success': True,
+            'message': f'共 {len(catalog)} 个站点，当前限定：{wanted or "全部"}',
+            'data': catalog,
+        }
 
     def api_scan(self, dry_run: Optional[bool] = None, show: str = '') -> Dict[str, Any]:
         """手动触发扫描。
@@ -669,6 +958,22 @@ class VarietyPilot(_PluginBase):
 
     # ------------------------------------------------------------------- 表单
 
+    def _site_items(self) -> List[Dict[str, Any]]:
+        """下拉选项：宿主站点库 + 配置里已有但库里找不到的 ID（保留以便用户自查）。"""
+        items: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+        for row in self.site_catalog():
+            label = f'{row["name"]}（{row["id"]}）' if row['name'] else str(row['id'])
+            if row['public']:
+                label += ' · 公开站'
+            items.append({'title': label, 'value': row['id']})
+            seen.add(row['id'])
+        for site_id in self._configured_site_ids():
+            if site_id in seen:
+                continue
+            items.append({'title': f'未知站点（{site_id}）', 'value': site_id})
+        return items
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
             {
@@ -712,12 +1017,12 @@ class VarietyPilot(_PluginBase):
                                 'props': {'cols': 12, 'md': 6},
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VCronField',
                                         'props': {
                                             'model': 'cron',
-                                            'label': '扫描周期（Cron）',
-                                            'placeholder': '*/30 * * * *',
-                                            'hint': '默认每 30 分钟扫描一次',
+                                            'label': '扫描周期',
+                                            'placeholder': '5 位 cron 表达式',
+                                            'hint': '点右侧按钮可视化选择；默认每 30 分钟扫描一次',
                                             'persistent-hint': True,
                                         },
                                     }
@@ -728,12 +1033,57 @@ class VarietyPilot(_PluginBase):
                                 'props': {'cols': 12, 'md': 6},
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VSelect',
                                         'props': {
                                             'model': 'site_ids',
-                                            'label': '限定站点 ID',
-                                            'placeholder': '留空表示全部站点',
-                                            'hint': '多个用英文逗号分隔，站点 ID 见 MP 站点管理',
+                                            'label': '限定站点',
+                                            'items': self._site_items(),
+                                            'multiple': True,
+                                            'chips': True,
+                                            'closable-chips': True,
+                                            'clearable': True,
+                                            'hint': '不选表示全部站点；只影响衍生内容的搜索范围',
+                                            'persistent-hint': True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            self._switch('sync_subscribe', '自动同步 MP 订阅中的综艺', 4),
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'sync_scope',
+                                            'label': '同步范围',
+                                            'items': [
+                                                {'title': '仅综艺（按 TMDB 类型判断）', 'value': 'variety'},
+                                                {'title': '全部电视剧订阅', 'value': 'all'},
+                                            ],
+                                            'hint': '判断依据是 TMDB 的真人秀/脱口秀类型',
+                                            'persistent-hint': True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'sync_exclude',
+                                            'label': '不跟踪的 TMDB ID',
+                                            'placeholder': '例：231620,126490',
+                                            'hint': '订阅里有、但不想让插件处理的剧；多个用英文逗号分隔',
                                             'persistent-hint': True,
                                         },
                                     }
@@ -826,7 +1176,12 @@ class VarietyPilot(_PluginBase):
                     },
                 ],
             }
-        ], dict(DEFAULT_CONFIG)
+        ], {
+            **DEFAULT_CONFIG,
+            **self._config,
+            # 旧版把站点存成逗号串，多选控件只认数组，这里统一一次
+            'site_ids': self._configured_site_ids(),
+        }
 
     @staticmethod
     def _switch(model: str, label: str, width: int = 4) -> dict:
@@ -879,13 +1234,26 @@ class VarietyPilot(_PluginBase):
             for task in recent
         ] or [{'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': '暂无任务记录'}}]
 
+        manual_ids = {show.tmdb_id for show in self._manual_shows}
         shows_rows = [
             {
                 'component': 'VListItem',
                 'props': {'density': 'compact'},
                 'content': [
-                    {'component': 'VListItemTitle', 'text': f'{show.name}（TMDB {show.tmdb_id}）'},
-                    {'component': 'VListItemSubtitle', 'text': f'别名：{", ".join(show.aliases) or "无"}'},
+                    {
+                        'component': 'VListItemTitle',
+                        'text': (
+                            f'{show.name}（TMDB {show.tmdb_id}）'
+                            f'　{"手动" if show.tmdb_id in manual_ids else "订阅"}'
+                        ),
+                    },
+                    {
+                        'component': 'VListItemSubtitle',
+                        'text': (
+                            f'别名：{", ".join(show.aliases) or "无"}'
+                            f' ｜ 站点：{", ".join(str(s) for s in show.sites) or "全部"}'
+                        ),
+                    },
                 ],
             }
             for show in self._shows
@@ -920,7 +1288,18 @@ class VarietyPilot(_PluginBase):
 
         return [
             head,
-            self._card('跟踪列表', [('', '\n'.join(f'{s.name} / TMDB {s.tmdb_id}' for s in self._shows) or '未配置')]),
+            self._sync_card(),
+            {
+                'component': 'VCard',
+                'props': {'variant': 'outlined', 'class': 'mb-4'},
+                'content': [
+                    {
+                        'component': 'VCardTitle',
+                        'text': f'跟踪列表（{len(self._shows)} 部，手动优先）',
+                    },
+                    {'component': 'VCardText', 'content': shows_rows},
+                ],
+            },
             {
                 'component': 'VCard',
                 'props': {'variant': 'tonal', 'class': 'mb-4'},
@@ -956,7 +1335,141 @@ class VarietyPilot(_PluginBase):
                 ],
             },
             self._card('上次扫描结果', [('', self._last_report or '尚未执行扫描')]),
+            self._site_card(),
         ]
+
+    def _sync_card(self) -> dict:
+        """订阅同步状态：让用户看得见「同步到了什么、为什么少了几部」。"""
+        enabled = _to_bool(self._config.get('sync_subscribe'), True)
+        content: List[dict] = []
+        if not enabled:
+            content.append(
+                {
+                    'component': 'VAlert',
+                    'props': {
+                        'type': 'info',
+                        'variant': 'tonal',
+                        'density': 'compact',
+                        'text': '未开启「自动同步 MP 订阅」。开启后插件会从现有订阅里挑出综艺自动跟踪。',
+                    },
+                }
+            )
+        else:
+            last = (
+                datetime.fromtimestamp(self._sync_at).strftime('%Y-%m-%d %H:%M')
+                if self._sync_at
+                else '尚未同步'
+            )
+            content.append(
+                {
+                    'component': 'VAlert',
+                    'props': {
+                        'type': 'success' if self._sync_at else 'info',
+                        'variant': 'tonal',
+                        'density': 'compact',
+                        'class': 'mb-2',
+                        'text': (
+                            f'上次同步：{last} ｜ 订阅识别 {len(self._auto_shows)} 部 ｜ '
+                            f'手动配置 {len(self._manual_shows)} 部 ｜ '
+                            f'范围：{"仅综艺" if str(self._config.get("sync_scope") or "variety") != "all" else "全部电视剧"}'
+                        ),
+                    },
+                }
+            )
+            for reason in self._sync_skipped[:8]:
+                content.append(
+                    {
+                        'component': 'VAlert',
+                        'props': {
+                            'type': 'warning',
+                            'variant': 'tonal',
+                            'density': 'compact',
+                            'class': 'mb-2',
+                            'text': reason,
+                        },
+                    }
+                )
+            if self._sync_error:
+                content.append(
+                    {
+                        'component': 'VAlert',
+                        'props': {
+                            'type': 'error',
+                            'variant': 'tonal',
+                            'density': 'compact',
+                            'text': self._sync_error,
+                        },
+                    }
+                )
+        return {
+            'component': 'VCard',
+            'props': {'variant': 'outlined', 'class': 'mb-4'},
+            'content': [
+                {'component': 'VCardTitle', 'text': '订阅同步'},
+                {'component': 'VCardText', 'content': content},
+            ],
+        }
+
+    def _site_card(self) -> dict:
+        """「限定站点 ID」对照表：直接列出数字 ID，省得用户去翻接口。"""
+        catalog = self.site_catalog()
+        wanted = self._configured_site_ids()
+        if not catalog:
+            return self._card(
+                '可用站点 ID',
+                [('', '读取站点列表失败，请在「设定 → 站点」里查看，或稍后刷新页面重试')],
+            )
+
+        picked = ', '.join(str(item) for item in wanted) or '全部站点'
+        rows: List[dict] = []
+        for row in catalog:
+            flag = '已选' if row['id'] in wanted else ('公开站' if row['public'] else '')
+            text = f'{row["id"]}　{row["name"]}　{row["domain"]}'
+            if flag:
+                text = f'{text}（{flag}）'
+            rows.append(
+                {
+                    'component': 'VListItem',
+                    'props': {'density': 'compact'},
+                    'content': [{'component': 'VListItemTitle', 'text': text}],
+                }
+            )
+
+        content: List[dict] = [
+            {
+                'component': 'VAlert',
+                'props': {
+                    'type': 'info',
+                    'variant': 'tonal',
+                    'density': 'compact',
+                    'class': 'mb-2',
+                    'text': f'当前生效：{picked}。把左侧数字填进「限定站点 ID」，多个用英文逗号分隔。',
+                },
+            },
+            *rows,
+        ]
+        for warning in self._site_warnings():
+            content.insert(
+                0,
+                {
+                    'component': 'VAlert',
+                    'props': {
+                        'type': 'warning',
+                        'variant': 'tonal',
+                        'density': 'compact',
+                        'class': 'mb-2',
+                        'text': warning,
+                    },
+                },
+            )
+        return {
+            'component': 'VCard',
+            'props': {'variant': 'outlined', 'class': 'mb-4'},
+            'content': [
+                {'component': 'VCardTitle', 'text': '可用站点 ID'},
+                {'component': 'VCardText', 'content': content},
+            ],
+        }
 
     @staticmethod
     def _card(title: str, items: List[Tuple[str, str]]) -> dict:
