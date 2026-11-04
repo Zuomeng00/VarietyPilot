@@ -1,0 +1,7 @@
+# MoviePilot 跑在 Linux 容器里，源码统一 LF
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.png binary
+*.zip binary

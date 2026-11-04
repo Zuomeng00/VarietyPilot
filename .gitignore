@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# MoviePilot 插件运行数据
+*.log
+data/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
