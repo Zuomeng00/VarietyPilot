@@ -19,7 +19,7 @@ from .store import (
     Task,
     TaskStore,
 )
-from .titles import ParsedTitle, parse_release, strip_show_name
+from .titles import ParsedTitle, parse_release, strip_show_name, subtype_label
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,8 @@ class Candidate:
     match: MatchResult
     description: str = ''
     free: bool = False
+    # 所属剧的 TMDB ID：提交下载时用它补 media_info
+    tmdb_id: int = 0
     # 同一份资源可落位的多个候选集号，按分数降序；落位环节取其中一个未被占用的
     options: list[MatchResult] = field(default_factory=list)
 
@@ -146,10 +148,8 @@ def _source_label(parsed: ParsedTitle) -> str:
     if parsed.episode is not None and not parsed.episode_is_site_ordinal:
         season = f'S{parsed.season:02d}' if parsed.season is not None else ''
         parts.append(f'{season}第{parsed.episode}期')
-    if parsed.subtype_word:
-        parts.append(parsed.subtype_word)
-    elif parsed.subtype:
-        parts.append(parsed.subtype)
+    if parsed.subtype:
+        parts.append(subtype_label(parsed))
     if parsed.part:
         parts.append(f'{parsed.part}集')
     return ' '.join(parts) or '-'
@@ -326,6 +326,7 @@ def build_candidates(
                 description=description,
                 free=_context_free(context),
                 options=options,
+                tmdb_id=show.tmdb_id,
             )
         )
     return candidates, derived, matched, unmatched

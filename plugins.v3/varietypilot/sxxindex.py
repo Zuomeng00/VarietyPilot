@@ -476,14 +476,18 @@ def score_episode(
         score -= SCORE_MODIFIER_MISS
         reasons.append(f'候选带修饰词（{candidate.modifier}）')
 
-    # 分P
+    # 分P：上/下是两份不同内容，不能靠其它维度补齐，冲突直接判否
     if target.part and candidate.part:
         if target.part == candidate.part:
             score += SCORE_PART_HIT
             reasons.append(f'分P一致（{target.part}）')
         else:
-            score -= SCORE_PART_HIT
-            reasons.append(f'分P不符（{target.part}≠{candidate.part}）')
+            return MatchResult(
+                episode=candidate.episode,
+                name=candidate.name,
+                score=-99.0,
+                reasons=[f'分P不符（{target.part}≠{candidate.part}）'],
+            )
     elif target.part and not candidate.part:
         score -= SCORE_PART_HIT
         reasons.append('候选项未标分P')

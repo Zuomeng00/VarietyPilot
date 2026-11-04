@@ -54,6 +54,28 @@ SUBTYPE_ALIASES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# 类型的中文短标签：站点资源名常写英文 Plus/Pure/Special，
+# 落位名和明细里统一显示中文，避免生成「第4季 第8期plus」这种半截英文文件名。
+SUBTYPE_LABELS: dict[str, str] = {
+    'plus_bonus': '加更',
+    'bonus': '彩蛋',
+    'pure': '纯享',
+    'prequel': '先导片',
+    'special': '特辑',
+    'live': '直播',
+    'clip': '直拍',
+    'extra': '衍生',
+}
+
+
+def subtype_label(parsed: 'ParsedTitle') -> str:
+    """取衍生类型的中文标签；标题里本来就是中文的写法优先保留。"""
+    word = parsed.subtype_word or ''
+    if word and not word.isascii():
+        return word
+    return SUBTYPE_LABELS.get(parsed.subtype or '', word)
+
+
 # 修饰词：区分「加更」与「还有加更 / 再次加更」这类同季同期同类型的多条记录。
 # 这一层是必需的——TMDB 里同一期的「加更」和「还有加更」是两条独立集。
 MODIFIER_ALIASES: dict[str, tuple[str, ...]] = {

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -87,7 +88,7 @@ from .store import (
 )
 from .sxxindex import SpecialIndexStore
 from .subscribes import TmdbGenreChecker, VarietyCache, collect, list_tv_subscriptions
-from .titles import parse_title
+from .titles import parse_title, subtype_label
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'notify': True,
     'refresh_library': True,
     'overwrite_existing': False,
+    'guard_unmatched': False,
     'index_ttl_hours': 12,
 }
 
@@ -160,7 +162,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.1'
+    plugin_version = '2.1.2'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -193,6 +195,7 @@ class VarietyPilot(_PluginBase):
         self._sync_skipped = []
         self._config = dict(DEFAULT_CONFIG)
         self._last_records = []
+        self._media_cache: Dict[int, Any] = {}
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ 配置
@@ -598,18 +601,79 @@ class VarietyPilot(_PluginBase):
             result = chain.search_by_title(name, 0, sites or None)
         return list(result or [])
 
+    def _media_info(self, tmdb_id: int) -> Any:
+        """按 TMDB ID 取媒体信息，供下载链使用。
+
+        搜索返回的上下文只有种子与元数据两部分，`media_info` 默认是空的，
+        而下载链要求它必须是 MediaInfo 对象，缺了会直接拒绝整次提交。
+        这里按剧缓存一份，每条资源提交时再深拷贝，避免季集字段被上一条污染。
+        """
+        if not tmdb_id:
+            return None
+        cache: Dict[int, Any] = self._media_cache
+        if tmdb_id in cache:
+            return cache[tmdb_id]
+
+        media = None
+        try:
+            from app.chain.media import MediaChain
+            from app.schemas.types import MediaSource
+
+            chain = MediaChain()
+            try:
+                media = chain.recognize_media(
+                    mtype=MediaType.TV,
+                    media_source=MediaSource.TMDB,
+                    media_id=str(tmdb_id),
+                )
+            except TypeError:
+                # 兼容早期签名：直接按 TMDB ID 识别
+                media = chain.recognize_media(tmdbid=tmdb_id, mtype=MediaType.TV)
+        except Exception as err:  # noqa: BLE001
+            logger.error(f'综艺衍生内容管家：获取 TMDB {tmdb_id} 媒体信息失败：{err}')
+        if media is None:
+            logger.warning(f'综艺衍生内容管家：TMDB {tmdb_id} 未识别到媒体信息')
+        cache[tmdb_id] = media
+        return media
+
+    @staticmethod
+    def _align_meta(context: Any, candidate: Candidate) -> None:
+        """把元数据的季集号对齐到特别集。
+
+        MP 的下载历史、下载前存在性校验、整理时的默认识别都以 meta_info 为准。
+        若继续用站点的 S04E08，这条加更会被登记成「第4季第8集」，
+        既可能让正片订阅误判为已下，也会在整理阶段压到正片集号上。
+        这里只改季集四个字段，标题等其余识别结果保持原样。
+        """
+        meta = getattr(context, 'meta_info', None)
+        if meta is None:
+            return
+        try:
+            meta.begin_season = 0
+            meta.end_season = None
+            meta.begin_episode = int(candidate.match.episode)
+            meta.end_episode = None
+            meta.total_episode = None
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f'综艺衍生内容管家：季集对齐失败，沿用原始元数据：{err}')
+
     def _download(self, candidate: Candidate) -> Tuple[bool, str]:
         from app.chain.download import DownloadChain
 
-        # 先做本地预检：MP 的下载链要求上下文同时带种子、媒体、元数据三部分，
-        # 缺任何一项都会整体失败，且报错文案不区分是哪一项缺，先在这里说清楚。
         context = candidate.context
-        missing = [
-            name for name in ('torrent_info', 'media_info', 'meta_info')
-            if getattr(context, name, None) is None
-        ]
-        if missing:
-            return False, f'下载上下文缺少 {"/".join(missing)}，无法提交'
+        if getattr(context, 'torrent_info', None) is None or getattr(context, 'meta_info', None) is None:
+            return False, '下载上下文缺少种子或元数据，无法提交'
+
+        # 搜索结果默认不带 media_info，必须由插件补齐下载链才肯接收
+        if getattr(context, 'media_info', None) is None:
+            media = self._media_info(candidate.tmdb_id)
+            if media is None:
+                return False, f'未能获取 TMDB {candidate.tmdb_id} 的媒体信息，无法提交'
+            context.media_info = copy.deepcopy(media)
+
+        # 提交前把季集对齐到特别季：下载历史、下载前存在性判断、
+        # 以及后续整理渲染都会以 S00 为准，不再使用站点的发布序号。
+        self._align_meta(context, candidate)
 
         chain = DownloadChain()
         try:
@@ -650,12 +714,59 @@ class VarietyPilot(_PluginBase):
             return
         task = self._match_task(rename_dict)
         if not task:
+            self._guard_unmatched(rename_dict)
             return
         apply_to_rename_dict(rename_dict, task.sxx_episode, task.sxx_name)
         logger.info(
             f'综艺衍生内容管家：{task.show_name} 整理改写为 S00E{task.sxx_episode:02d}'
             f'《{task.sxx_name}》（原 {task.title}）'
         )
+
+    def _guard_unmatched(self, rename_dict: Dict[str, Any]) -> None:
+        """兜底：能判定是衍生内容、但插件没有对应任务时，也不让它占用正片集号。
+
+        这类文件通常是用户手动搜索下载的，或插件扫描后才补进来的。
+        按站点编号把季号强制归零、集号放进 9xx 段，既保证不覆盖正片，
+        也能在极影视/Emby 的特别季里看到；TMDB 补录后由正常任务接管。
+        """
+        if not _to_bool(self._config.get('guard_unmatched'), False):
+            return
+        if _to_int(rename_dict.get('season'), -1) == 0:
+            return
+        target = self._guard_target(rename_dict)
+        if target is None:
+            return
+        episode, title = target
+        apply_to_rename_dict(rename_dict, episode, title)
+        logger.warning(
+            f'综艺衍生内容管家：未匹配任务，兜底改写为 S00E{episode}《{title}》'
+            f'（原 {rename_dict.get("original_name")}）'
+        )
+
+    @staticmethod
+    def _guard_target(rename_dict: Dict[str, Any]) -> Optional[Tuple[int, str]]:
+        """为未接管的衍生文件算出兜底特别集号与集名。"""
+        original = str(rename_dict.get('original_name') or '')
+        if not original:
+            return None
+        parsed = parse_title(original)
+        if parsed is None or parsed.subtype is None:
+            return None
+        site_episode = parsed.site_episode or parsed.episode
+        if not site_episode:
+            # 没有编号就无法稳定落位，交回 MP 原流程
+            return None
+
+        episode = 900 + int(site_episode)
+        word = subtype_label(parsed)
+        show_season = parsed.season if parsed.season is not None else parsed.site_season
+        if parsed.episode and show_season:
+            title = f'第{show_season}季 第{parsed.episode}期{word}（TMDB未收录）'
+        elif show_season:
+            title = f'第{show_season}季 站点E{int(site_episode):02d} {word}（TMDB未收录）'
+        else:
+            title = f'{word}（TMDB未收录）'
+        return episode, title
 
     @eventmanager.register(ChainEventType.TransferRename)
     def on_transfer_rename(self, event: Event) -> None:
@@ -670,9 +781,15 @@ class VarietyPilot(_PluginBase):
         if not isinstance(rename_dict, dict) or not render_str:
             return
         task = self._match_task(rename_dict)
-        if not task:
+        if task:
+            new_str = rewrite_render_str(render_str, task.sxx_episode)
+        elif _to_bool(self._config.get('guard_unmatched'), False) and _to_int(rename_dict.get('season'), -1) != 0:
+            target = self._guard_target(rename_dict)
+            if target is None:
+                return
+            new_str = rewrite_render_str(render_str, target[0])
+        else:
             return
-        new_str = rewrite_render_str(render_str, task.sxx_episode)
         if new_str == render_str:
             return
         data.updated = True
@@ -1191,6 +1308,31 @@ class VarietyPilot(_PluginBase):
                                             'model': 'index_ttl_hours',
                                             'label': '特别季缓存(小时)',
                                             'type': 'number',
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            self._switch('guard_unmatched', '未接管资源也强制进特别季', 6),
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'warning',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': (
+                                                '开启后，手动下载或插件未接管的衍生文件也会被改写为 '
+                                                'Season 00 的 9xx 集，避免占用正片集号被覆盖；'
+                                                '关闭时这类文件按 MP 原流程落位。'
+                                            ),
                                         },
                                     }
                                 ],
