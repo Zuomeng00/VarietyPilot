@@ -76,7 +76,7 @@ except Exception:  # pragma: no cover - 脱离宿主时的兜底，便于独立�
     EventType = _FakeEventType  # type: ignore[assignment]
     MediaType = _FakeMediaType  # type: ignore[assignment]
 
-from .pipeline import Candidate, Options, TrackedShow, scan_show
+from .pipeline import Candidate, Options, TrackedShow, scan_show, signature_of
 from .renaming import apply_to_rename_dict, rewrite_render_str
 from .store import (
     STATUS_DONE,
@@ -86,9 +86,9 @@ from .store import (
     Task,
     TaskStore,
 )
-from .sxxindex import SpecialIndexStore
+from .sxxindex import SpecialIndexStore, subtypes_compatible
 from .subscribes import TmdbGenreChecker, VarietyCache, collect, list_tv_subscriptions
-from .titles import parse_title, subtype_label
+from .titles import SUBTYPE_LABELS, parse_title, subtype_label
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +163,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.5'
+    plugin_version = '2.1.6'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -789,11 +789,36 @@ class VarietyPilot(_PluginBase):
         if not task:
             self._guard_unmatched(rename_dict)
             return
-        apply_to_rename_dict(rename_dict, task.sxx_episode, task.sxx_name)
+        apply_to_rename_dict(rename_dict, task.sxx_episode, self._task_display_title(task))
         logger.info(
             f'综艺衍生内容管家：{task.show_name} 整理改写为 S00E{task.sxx_episode:02d}'
             f'《{task.sxx_name}》（原 {task.title}）'
         )
+
+    @staticmethod
+    def _task_display_title(task: Task) -> str:
+        """文件名里用的集名。
+
+        任务上的 sxx_name 来自 TMDB 集名，正常都有值。早期记录可能为空，
+        这时退回「第X季 第X期 加更」这种写法，避免文件被命名成「第 64 集」——
+        那种名字既看不出是哪一期，也没法和媒体库里的集对上。
+        """
+        if task.sxx_name:
+            return task.sxx_name
+        season = task.src_season if task.src_season is not None else task.src_site_season
+        period = task.src_episode
+        if period is not None and period == task.src_site_episode:
+            # 站点编号不是期号，别把它当期号写进文件名
+            period = None
+        word = task.subtype_word or SUBTYPE_LABELS.get(task.subtype or '', '')
+        parts = []
+        if season:
+            parts.append(f'第{season}季')
+        if period:
+            parts.append(f'第{period}期')
+        if word:
+            parts.append(word)
+        return ' '.join(parts) or f'第{task.sxx_episode}集'
 
     def _guard_unmatched(self, rename_dict: Dict[str, Any]) -> None:
         """兜底：能判定是衍生内容、但插件没有对应任务时，也不让它占用正片集号。
@@ -943,13 +968,27 @@ class VarietyPilot(_PluginBase):
             return None
 
         title = str(rename_dict.get('name') or rename_dict.get('title') or '')
+        tasks = [
+            task
+            for task in self._store.all()
+            if task.status in (STATUS_SUBMITTED, STATUS_QUEUED)
+            and not (title and task.show_name not in title and title not in task.show_name)
+            and self._is_derived_file(parsed, original, task)
+        ]
 
-        for task in self._store.all():
-            if task.status not in (STATUS_SUBMITTED, STATUS_QUEUED):
-                continue
-            if title and task.show_name not in title and title not in task.show_name:
-                continue
-            if not self._is_derived_file(parsed, original, task):
+        # 先按内容指纹精确回连。同一个站点编号下面可能挂着好几条任务
+        # （S03E23 既有加更版又有直拍版），只按编号匹配会随手挑中一条，
+        # 文件就被改到别人那一集上。
+        signature = signature_of(parsed) if parsed is not None else ''
+        if signature:
+            exact = f'sig|{signature}'
+            for task in tasks:
+                if task.content_key == exact:
+                    return task
+
+        for task in tasks:
+            # 类型对不上的不是同一条内容，宁可漏改也不改错
+            if parsed is not None and not subtypes_compatible(parsed.subtype, task.subtype):
                 continue
             if task.src_site_season is not None and seasons and task.src_site_season not in seasons:
                 continue

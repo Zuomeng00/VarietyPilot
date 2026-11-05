@@ -8,9 +8,16 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 from typing import Any, Callable, Optional
 
-from .sxxindex import MIN_ACCEPT_SCORE, MatchResult, SpecialIndex, rank_specials
+from .sxxindex import (
+    MIN_ACCEPT_SCORE,
+    MatchResult,
+    SpecialIndex,
+    rank_specials,
+    subtypes_compatible,
+)
 from .store import (
     STATUS_DONE,
     STATUS_QUEUED,
@@ -102,6 +109,8 @@ class Candidate:
     free: bool = False
     # 所属剧的 TMDB ID：提交下载时用它补 media_info
     tmdb_id: int = 0
+    # 种子发布时间：直拍、空降直播这类集名不带期号的，只能靠日期对齐
+    pubdate: Optional[date] = None
     # 同一份资源可落位的多个候选集号，按分数降序；落位环节取其中一个未被占用的
     options: list[MatchResult] = field(default_factory=list)
 
@@ -234,6 +243,27 @@ def _context_site(context: Any) -> str:
     return ''
 
 
+def _context_pubdate(context: Any) -> Optional[date]:
+    """种子的发布时间。同名的多集（直拍、空降直播）只能靠日期对齐。"""
+    torrent = getattr(context, 'torrent_info', None)
+    if torrent is None:
+        return None
+    value = getattr(torrent, 'pubdate', None)
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value)[:10]
+    for fmt in ('%Y-%m-%d', '%Y/%m/%d', '%Y%m%d'):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def _context_size(context: Any) -> int:
     torrent = getattr(context, 'torrent_info', None)
     value = getattr(torrent, 'size', 0) if torrent is not None else 0
@@ -334,7 +364,9 @@ def build_candidates(
             if is_derived and season_filtered is not None:
                 season_filtered.append(title)
             continue
-        options = rank_specials(parsed, index, seasons=show.seasons)
+        options = rank_specials(
+            parsed, index, air_date=_context_pubdate(context), seasons=show.seasons
+        )
         result = options[0] if options else None
         if is_derived:
             derived += 1
@@ -362,6 +394,7 @@ def build_candidates(
                 free=_context_free(context),
                 options=options,
                 tmdb_id=show.tmdb_id,
+                pubdate=_context_pubdate(context),
             )
         )
     return candidates, derived, matched, unmatched
@@ -424,19 +457,14 @@ def _group_keys(candidate: Candidate) -> list[tuple]:
     return keys
 
 
-def content_signature(candidate: Candidate) -> str:
-    """内容语义指纹：季 + 期号 + 片段名 + 衍生类型 + 修饰词 + 分P。
+def signature_of(parsed: Any) -> str:
+    """按解析结果算内容签名，扫描与整理两条链路共用。
 
-    刻意不含两样东西：
-
-    1. 清晰度——1080p 与 2160p 是同一份内容的不同版本；
-    2. 站点 SxxExx——各站各编各的号，同一期加更在 A 站是 S04E07、
-       在 B 站可能是 2025E09。编号一进指纹，两个站点就认不出是同一期，
-       于是 1080p、2160p 各下一遍。
-
-    期号和片段名都拿不到时返回空串，由调用方退回站点序号。
+    整理阶段只有文件名可解析，没有 Candidate，所以签名逻辑必须能脱离
+    Candidate 单独调用，否则「这份文件对应哪条任务」又只能靠站点编号去猜。
     """
-    parsed = candidate.parsed
+    if parsed is None:
+        return ''
     segment = _segment_name(parsed)
     episode: Optional[int] = None
     if parsed.episode is not None and not parsed.episode_is_site_ordinal:
@@ -457,6 +485,21 @@ def content_signature(candidate: Candidate) -> str:
             parsed.part or '',
         ]
     )
+
+
+def content_signature(candidate: Candidate) -> str:
+    """内容语义指纹：季 + 期号 + 片段名 + 衍生类型 + 修饰词 + 分P。
+
+    刻意不含两样东西：
+
+    1. 清晰度——1080p 与 2160p 是同一份内容的不同版本；
+    2. 站点 SxxExx——各站各编各的号，同一期加更在 A 站是 S04E07、
+       在 B 站可能是 2025E09。编号一进指纹，两个站点就认不出是同一期，
+       于是 1080p、2160p 各下一遍。
+
+    期号和片段名都拿不到时返回空串，由调用方退回站点序号。
+    """
+    return signature_of(candidate.parsed)
 
 
 def _legacy_content_key(candidate: Candidate) -> str:
@@ -544,6 +587,7 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
     skipped: list[tuple[Candidate, str]] = []
 
     for items in ordered:
+        want = items[0].parsed.subtype
         pool: list[MatchResult] = []
         for item in items:
             options = item.options or [item.match]
@@ -556,13 +600,20 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
             if option.episode in seen:
                 continue
             seen.add(option.episode)
+            # 类型对不上的集不占：加更占掉直拍那一集，刮削就全乱了
+            if not subtypes_compatible(want, option.subtype):
+                continue
             if option.episode in used:
                 continue
             pick = option
             break
 
         if pick is None:
-            reason = '可用的特别集号都已被本轮其他资源占用，本轮先不处理'
+            reason = (
+                '没有类型相符的特别集可落位，本轮先不处理'
+                if any(not subtypes_compatible(want, option.subtype) for option in pool)
+                else '可用的特别集号都已被本轮其他资源占用，本轮先不处理'
+            )
             for item in items:
                 skipped.append((item, reason))
             continue

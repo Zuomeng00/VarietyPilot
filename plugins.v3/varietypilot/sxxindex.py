@@ -53,6 +53,21 @@ SUBTYPE_NEIGHBORS: dict[str, set[str]] = {
 }
 
 
+def subtypes_compatible(left: Optional[str], right: Optional[str]) -> bool:
+    """两种衍生类型能不能落到同一集。
+
+    加更落到「黄景瑜直拍」那一集上，文件名和内容就是两回事，刮削全错。
+    所以只认同一种类型：加更只能进加更集、彩蛋只能进彩蛋集。
+    邻接类型（加更≈彩蛋≈纯享）只用来打分，不作为落位依据——
+    第 3 季没登记彩蛋时，彩蛋资源该去等待队列，不能去占加更的位置。
+
+    两边有一边没标类型时放行，交给期号、日期这些信号判断。
+    """
+    if not left or not right:
+        return True
+    return left == right
+
+
 @dataclass(slots=True)
 class SpecialEpisode:
     """TMDB S00 中的一集。"""
@@ -91,6 +106,8 @@ class MatchResult:
     score: float
     reasons: list[str] = field(default_factory=list)
     air_date: Optional[str] = None
+    # 这一集在 TMDB 集名里标明的衍生类型，落位时用它挡住类型不符的集
+    subtype: Optional[str] = None
 
     def describe(self) -> str:
         return f'S00E{self.episode:02d} 《{self.name}》 得分 {self.score:.1f}（{"; ".join(self.reasons)}）'
@@ -443,7 +460,13 @@ def score_episode(
             score += SCORE_EPISODE_HIT
             reasons.append(f'期号一致 第{target.episode}期')
         else:
-            return MatchResult(episode=candidate.episode, name=candidate.name, score=-99.0, reasons=['期号不符'])
+            return MatchResult(
+                episode=candidate.episode,
+                name=candidate.name,
+                score=-99.0,
+                reasons=['期号不符'],
+                subtype=candidate.subtype,
+            )
     elif target.episode_is_site_ordinal and candidate.period is not None:
         reasons.append(f'站点序号 E{target.episode}（不作期号）')
 
@@ -487,6 +510,7 @@ def score_episode(
                 name=candidate.name,
                 score=-99.0,
                 reasons=[f'分P不符（{target.part}≠{candidate.part}）'],
+                subtype=candidate.subtype,
             )
     elif target.part and not candidate.part:
         score -= SCORE_PART_HIT
@@ -518,6 +542,7 @@ def score_episode(
         score=score,
         reasons=reasons,
         air_date=candidate.air_date,
+        subtype=candidate.subtype,
     )
 
 
@@ -543,6 +568,13 @@ def rank_specials(
     if allowed:
         # 集名没写季号的不做限制，无法判断就别误杀
         episodes = [item for item in episodes if item.season is None or item.season in allowed]
+        if not episodes:
+            return []
+    if target.subtype:
+        # 类型不符的集直接排除：加更不能落到直拍集上
+        episodes = [
+            item for item in episodes if subtypes_compatible(target.subtype, item.subtype)
+        ]
         if not episodes:
             return []
     scored = [score_episode(target, episode, index, target_date=air_date) for episode in episodes]
