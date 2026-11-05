@@ -1,4 +1,4 @@
-# 综艺衍生内容管家 VarietyPilot v2.1.3
+# 综艺衍生内容管家 VarietyPilot v2.1.4
 
 MoviePilot v3 插件。解决综艺订阅的三件事：
 

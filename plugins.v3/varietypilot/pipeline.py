@@ -358,29 +358,98 @@ def _ordinal(candidate: Candidate) -> Optional[int]:
     return None
 
 
+def _segment_name(parsed: Any) -> str:
+    """资源的片段名。
+
+    只有纯享、直拍这类真按片段拆分的资源，副标题「：」后面才是片段名。
+    加更/彩蛋后面那段是内容简介，同一份内容换个清晰度或换个站点就可能改写，
+    当片段名用会把同一期拆成两条、各占一个集号。
+    """
+    if parsed.subtype not in ('pure', 'clip'):
+        return ''
+    return (parsed.segment or '').strip()
+
+
 def _group_keys(candidate: Candidate) -> list[tuple]:
     """可用于判定「同一份内容」的键，命中任意一个就归为一组。
 
     1. 站点发布序号：同站同一条资源的 1080p/2160p 共用，最可靠；
-    2. 片段名：不同站点各编各的号，但纯享片段的副标题带名字，名字相同即同一段。
+    2. 片段名：不同站点各编各的号，但纯享片段的副标题带名字，名字相同即同一段；
+    3. 内容签名：跨站点唯一可靠的一条，见 content_signature。
     """
     base = _content_base(candidate)
     keys: list[tuple] = []
     ordinal = _ordinal(candidate)
     if ordinal is not None:
         keys.append(base + ('ord', ordinal))
-    segment = (candidate.parsed.segment or '').strip()
+    segment = _segment_name(candidate.parsed)
     if segment:
         keys.append(base + ('seg', segment))
     if not keys:
         episode = candidate.parsed.episode
         keys.append(base + ('episode', episode))
+    signature = content_signature(candidate)
+    if signature:
+        keys.append(('sig', signature))
     return keys
+
+
+def content_signature(candidate: Candidate) -> str:
+    """内容语义指纹：季 + 期号 + 片段名 + 衍生类型 + 修饰词 + 分P。
+
+    刻意不含两样东西：
+
+    1. 清晰度——1080p 与 2160p 是同一份内容的不同版本；
+    2. 站点 SxxExx——各站各编各的号，同一期加更在 A 站是 S04E07、
+       在 B 站可能是 2025E09。编号一进指纹，两个站点就认不出是同一期，
+       于是 1080p、2160p 各下一遍。
+
+    期号和片段名都拿不到时返回空串，由调用方退回站点序号。
+    """
+    parsed = candidate.parsed
+    segment = _segment_name(parsed)
+    episode: Optional[int] = None
+    if parsed.episode is not None and not parsed.episode_is_site_ordinal:
+        episode = parsed.episode
+    if episode is None and not segment:
+        return ''
+    season = parsed.season
+    if season is not None and season >= 1900 and season == parsed.site_season:
+        # 四位数的「季号」其实是年份写法，各站不统一，不能当内容特征
+        season = None
+    return '|'.join(
+        [
+            '' if season is None else str(season),
+            '' if episode is None else str(episode),
+            segment,
+            parsed.subtype or '',
+            parsed.modifier or '',
+            parsed.part or '',
+        ]
+    )
+
+
+def _legacy_content_key(candidate: Candidate) -> str:
+    """2.1.3 及更早版本写入的指纹格式，保留用于匹配升级前的任务记录。"""
+    return '|'.join(str(item) for item in _group_keys(candidate)[0])
 
 
 def content_key(candidate: Candidate) -> str:
     """写入任务的持久化指纹：跨扫描轮次判断「这份内容下过没有」。"""
-    return '|'.join(str(item) for item in _group_keys(candidate)[0])
+    signature = content_signature(candidate)
+    if signature:
+        return 'sig|' + signature
+    return _legacy_content_key(candidate)
+
+
+def content_keys(candidate: Candidate) -> list[str]:
+    """一份内容可能对应的全部指纹，新旧格式都算，避免升级后判重失忆。"""
+    keys = [content_key(candidate)]
+    legacy = _legacy_content_key(candidate)
+    if legacy not in keys:
+        keys.append(legacy)
+    return keys
+
 
 
 def _group_candidates(candidates: list[Candidate]) -> list[list[Candidate]]:
@@ -607,7 +676,12 @@ def scan_show(
     done_status = (STATUS_SUBMITTED, STATUS_QUEUED, STATUS_DONE)
     fresh: list[Candidate] = []
     for candidate in eligible:
-        existing = store.find_by_content(show.tmdb_id, content_key(candidate), statuses=done_status)
+        existing = None
+        # 新旧两种指纹都查：升级前的记录只有旧格式，只查新格式会漏判
+        for key in content_keys(candidate):
+            existing = store.find_by_content(show.tmdb_id, key, statuses=done_status)
+            if existing is not None:
+                break
         if existing is None:
             # 升级前的任务记录没有指纹，退回按站点序号判断
             parsed = candidate.parsed

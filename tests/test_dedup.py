@@ -33,10 +33,10 @@ SHOW = TrackedShow(name='现在就出发', tmdb_id=231620, aliases=['Natural Hig
 
 class FakeTorrent:
     def __init__(self, title: str, description: str = '', size: int = 2 * 1024 ** 3,
-                 seeders: int = 10, factor: float = 1.0) -> None:
+                 seeders: int = 10, factor: float = 1.0, site: str = '站点A') -> None:
         self.title = title
         self.description = description
-        self.site_name = '站点A'
+        self.site_name = site
         self.size = size
         self.seeders = seeders
         self.downloadvolumefactor = factor
@@ -80,9 +80,11 @@ INDEX_SHIFTED = _index(
 )
 
 OPTIONS = Options(min_seeders=1, min_size_gb=0.05, max_size_gb=20.0, prefer_resolution='2160p')
+OPTIONS_1080 = Options(min_seeders=1, min_size_gb=0.05, max_size_gb=20.0, prefer_resolution='1080p')
 
 
-def _run(store: TaskStore, index: SpecialIndex, contexts: list, submitted: list[str]):
+def _run(store: TaskStore, index: SpecialIndex, contexts: list, submitted: list[str],
+         options: Options = OPTIONS):
     def download(candidate):
         submitted.append(candidate.title)
         return True, 'hash'
@@ -91,7 +93,7 @@ def _run(store: TaskStore, index: SpecialIndex, contexts: list, submitted: list[
         show=SHOW,
         index=index,
         store=store,
-        options=OPTIONS,
+        options=options,
         search_fn=lambda name, sites: list(contexts),
         download_fn=download,
     )
@@ -272,6 +274,114 @@ def test_legacy_task_without_fingerprint() -> None:
         assert any('已下载过' in line for line in reasons), reasons
 
 
+def test_cross_site_two_resolutions() -> None:
+    """不同站点各发一条，站点编号不同，但内容是同一期——只下一份。
+
+    真实现场：站点 A 用 S04E07、站点 B 用 2025E09 标同一期加更，
+    站点编号一不同，旧逻辑就把它们当成两份内容，1080p 和 2160p 各下一遍。
+    """
+    options = Options(min_seeders=1, min_size_gb=0.05, max_size_gb=20.0, prefer_resolution='1080p')
+    contexts = [
+        FakeContext('Natural High S04E07 Plus 2026 1080p TX WEB-DL H265 AAC-ADWeb',
+                    '现在就出发 第四季 加更 第04期加更：沈腾黄景瑜双簧帮唱', site='站点A'),
+        FakeContext('Natural High 2025E09 Plus 2026 2160p TX WEB-DL H265 DDP2.0-ADWeb',
+                    '现在就出发 第四季 加更 第04期加更：沈腾黄景瑜双簧帮唱', site='站点B',
+                    size=5 * 1024 ** 3),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        store = TaskStore(Path(tmp) / 'tasks.json')
+        submitted: list[str] = []
+        report = _run(store, INDEX_BASE, contexts, submitted, options=options)
+        assert report.submitted == 1, f'同一期只该下 1 条，实际 {report.submitted}：{submitted}'
+        assert '1080p' in submitted[0], f'偏好 1080p，实际选了 {submitted[0]}'
+
+
+def test_cross_site_next_round_not_redownloaded() -> None:
+    """上一轮从站点 A 下了 1080p，这一轮站点 B 冒出 2160p，不能再下一遍。"""
+    options = Options(min_seeders=1, min_size_gb=0.05, max_size_gb=20.0, prefer_resolution='1080p')
+    desc = '现在就出发 第四季 加更 第04期加更：沈腾黄景瑜双簧帮唱'
+    with tempfile.TemporaryDirectory() as tmp:
+        store = TaskStore(Path(tmp) / 'tasks.json')
+        first: list[str] = []
+        _run(
+            store,
+            INDEX_BASE,
+            [FakeContext('Natural High S04E07 Plus 2026 1080p TX WEB-DL H265 AAC-ADWeb',
+                         desc, site='站点A')],
+            first,
+            options=options,
+        )
+        assert len(first) == 1, first
+
+        second: list[str] = []
+        report = _run(
+            store,
+            INDEX_BASE,
+            [FakeContext('Natural High 2025E09 Plus 2026 2160p TX WEB-DL H265 DDP2.0-ADWeb',
+                         desc, site='站点B', size=5 * 1024 ** 3)],
+            second,
+            options=options,
+        )
+        assert second == [], f'换站点换清晰度不该再下：{second}'
+        reasons = [r['reason'] for r in report.records if r['status'] == '跳过']
+        assert any('已下载过' in line for line in reasons), reasons
+
+
+def test_no_matching_resolution_still_downloads() -> None:
+    """偏好 1080p 但站点只有 2160p 时，宁可下 2160p 也不能空手而归。"""
+    options = Options(min_seeders=1, min_size_gb=0.05, max_size_gb=20.0, prefer_resolution='1080p')
+    with tempfile.TemporaryDirectory() as tmp:
+        store = TaskStore(Path(tmp) / 'tasks.json')
+        submitted: list[str] = []
+        _run(
+            store,
+            INDEX_BASE,
+            [FakeContext('Natural High S04E07 Plus 2026 2160p TX WEB-DL H265 DDP2.0-ADWeb',
+                         '现在就出发 第四季 加更 第04期加更', size=5 * 1024 ** 3)],
+            submitted,
+            options=options,
+        )
+        assert len(submitted) == 1, submitted
+        assert '2160p' in submitted[0], submitted
+
+
+def test_cross_site_different_subtitle() -> None:
+    """两个站点给同一期加更写的简介不一样，仍然只下一份。
+
+    副标题「：」后面那段是内容简介，不是片段名。把它当片段名用，
+    同一份内容会因为简介改写被当成两条，各落一个集号。
+    """
+    options = Options(min_seeders=1, min_size_gb=0.05, max_size_gb=20.0, prefer_resolution='1080p')
+    contexts = [
+        FakeContext('Natural High S04E07 Plus 2026 1080p TX WEB-DL H265 AAC-ADWeb',
+                    '现在就出发 第四季 加更 第04期加更：沈腾黄景瑜双簧帮唱', site='站点A'),
+        FakeContext('Natural High 2025E09 Plus 2026 2160p TX WEB-DL H265 DDP2.0-ADWeb',
+                    '现在就出发 第四季 加更 第04期加更：沈腾黄景瑜双簧帮唱加长版', site='站点B',
+                    size=5 * 1024 ** 3),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        store = TaskStore(Path(tmp) / 'tasks.json')
+        submitted: list[str] = []
+        report = _run(store, INDEX_BASE, contexts, submitted, options=options)
+        assert report.submitted == 1, f'只应下 1 条，实际 {report.submitted}：{submitted}'
+        assert '1080p' in submitted[0], submitted
+
+
+def test_pure_segment_keeps_apart() -> None:
+    """纯享的片段名是真片段名，同期两个不同片段必须各下一份。"""
+    contexts = [
+        FakeContext('Natural High S04E16 Pure 2026 1080p TX WEB-DL H265 AAC-ADWeb',
+                    '现在就出发 第四季 纯享 第04期纯享：小画家'),
+        FakeContext('Natural High S04E17 Pure 2026 1080p TX WEB-DL H265 AAC-ADWeb',
+                    '现在就出发 第四季 纯享 第04期纯享：二指追击战'),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        store = TaskStore(Path(tmp) / 'tasks.json')
+        submitted: list[str] = []
+        _run(store, INDEX_BASE, contexts, submitted, options=OPTIONS_1080)
+        assert len(submitted) == 2, f'两个不同片段应各下一份：{submitted}'
+
+
 def test_sync_interval_gate() -> None:
     """订阅同步按间隔节流：默认 30 分钟，0 表示每轮都同步。"""
     plugin = VarietyPilot()
@@ -305,6 +415,11 @@ if __name__ == '__main__':
     check('指纹与清晰度无关', test_content_key_ignores_resolution)
     check('清晰度优先于免费', test_resolution_beats_free)
     check('升级前的旧记录也能挡住重复', test_legacy_task_without_fingerprint)
+    check('跨站点同内容只下一份', test_cross_site_two_resolutions)
+    check('跨站点换清晰度不再重复', test_cross_site_next_round_not_redownloaded)
+    check('没有偏好清晰度时照常下载', test_no_matching_resolution_still_downloads)
+    check('副标题简介不同也算同一份', test_cross_site_different_subtitle)
+    check('纯享不同片段各下一份', test_pure_segment_keeps_apart)
     check('同步间隔节流', test_sync_interval_gate)
     check('同步间隔默认 30 分钟', test_sync_interval_default)
     print('全部通过：重复下载拦截 + 同步节流')
