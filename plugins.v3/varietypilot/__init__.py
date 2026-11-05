@@ -163,7 +163,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.4'
+    plugin_version = '2.1.5'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -263,9 +263,24 @@ class VarietyPilot(_PluginBase):
                 sites.append(value)
         return sites
 
+    @staticmethod
+    def _parse_seasons(raw: Any) -> List[int]:
+        """季号配置：`4`、`4,5`、`S4`、`第4季` 都认；空或 0 表示不限季。"""
+        if isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = re.split(r'[,，、/\s]+', str(raw or '').strip())
+        seasons: List[int] = []
+        for item in values:
+            digits = re.sub(r'[^0-9]', '', str(item))
+            value = _to_int(digits, 0)
+            if value > 0 and value not in seasons:
+                seasons.append(value)
+        return seasons
+
     @classmethod
     def _parse_shows(cls, text: str, site_raw: Any) -> List[TrackedShow]:
-        """解析剧列表，每行 `剧名|TMDBID|年份`, 每行 `剧名|TMDBID|别名1,别名2` 也可用。"""
+        """解析剧列表，每行 `剧名|TMDBID|年份|别名1,别名2|季号`，后三段都可省略。"""
         shows: List[TrackedShow] = []
         sites = cls._parse_site_ids(site_raw)
         for raw in (text or '').splitlines():
@@ -291,7 +306,17 @@ class VarietyPilot(_PluginBase):
                     aliases = [item.strip() for item in extra.replace('，', ',').split(',') if item.strip()]
             if len(parts) >= 4 and parts[3]:
                 aliases = [item.strip() for item in parts[3].replace('，', ',').split(',') if item.strip()]
-            shows.append(TrackedShow(name=name, tmdb_id=tmdb_id, year=year, aliases=aliases, sites=sites))
+            seasons = cls._parse_seasons(parts[4]) if len(parts) >= 5 and parts[4] else []
+            shows.append(
+                TrackedShow(
+                    name=name,
+                    tmdb_id=tmdb_id,
+                    year=year,
+                    aliases=aliases,
+                    sites=sites,
+                    seasons=seasons,
+                )
+            )
         return shows
 
     def _configured_site_ids(self) -> List[int]:
@@ -321,6 +346,7 @@ class VarietyPilot(_PluginBase):
             return
         sites = self._configured_site_ids()
         shows: List[TrackedShow] = []
+        stale = False
         for item in raw.get('shows') or []:
             if not isinstance(item, dict):
                 continue
@@ -328,16 +354,20 @@ class VarietyPilot(_PluginBase):
             name = str(item.get('name') or '').strip()
             if tmdb_id <= 0 or not name:
                 continue
+            if 'seasons' not in item:
+                # 升级前的缓存没有季号，按「不限季」跑会把前几季也下下来
+                stale = True
             shows.append(
                 TrackedShow(
                     name=name,
                     tmdb_id=tmdb_id,
                     year=str(item.get('year') or ''),
                     sites=sites,
+                    seasons=self._parse_seasons(item.get('seasons')),
                 )
             )
         self._auto_shows = shows
-        self._sync_at = _to_float(raw.get('at'), 0.0)
+        self._sync_at = 0.0 if stale else _to_float(raw.get('at'), 0.0)
         self._sync_skipped = [str(item) for item in (raw.get('skipped') or []) if item]
 
     def _save_auto_shows(self) -> None:
@@ -348,7 +378,12 @@ class VarietyPilot(_PluginBase):
             'at': self._sync_at,
             'skipped': self._sync_skipped,
             'shows': [
-                {'tmdb_id': show.tmdb_id, 'name': show.name, 'year': show.year}
+                {
+                    'tmdb_id': show.tmdb_id,
+                    'name': show.name,
+                    'year': show.year,
+                    'seasons': list(show.seasons),
+                }
                 for show in self._auto_shows
             ],
         }
@@ -405,7 +440,13 @@ class VarietyPilot(_PluginBase):
 
         sites = self._configured_site_ids()
         self._auto_shows = [
-            TrackedShow(name=row.name, tmdb_id=row.tmdb_id, year=row.year, sites=sites)
+            TrackedShow(
+                name=row.name,
+                tmdb_id=row.tmdb_id,
+                year=row.year,
+                sites=sites,
+                seasons=list(row.seasons),
+            )
             for row in found
         ]
         self._sync_at = time.time()
@@ -1185,8 +1226,8 @@ class VarietyPilot(_PluginBase):
                                             'model': 'shows',
                                             'label': '跟踪的综艺',
                                             'rows': 5,
-                                            'placeholder': '现在就出发|231620|2023\n我家那闺女|126490|别名1,别名2',
-                                            'hint': '每行一部：剧名|TMDB ID|可选（年份或别名）。TMDB ID 为剧集页地址 /tv/ 后面的数字。',
+                                            'placeholder': '现在就出发|231620|2023||4\n我家那闺女|126490|2023||3,4',
+                                            'hint': '每行一部：剧名|TMDB ID|年份|别名|季号，后三段可省略。季号留空表示不限季；订阅同步来的剧自动跟随订阅的季，不用手填。',
                                             'persistent-hint': True,
                                         },
                                     }
@@ -1483,6 +1524,7 @@ class VarietyPilot(_PluginBase):
                         'text': (
                             f'别名：{", ".join(show.aliases) or "无"}'
                             f' ｜ 站点：{", ".join(str(s) for s in show.sites) or "全部"}'
+                            f' ｜ 范围：{show.season_label}'
                         ),
                     },
                 ],

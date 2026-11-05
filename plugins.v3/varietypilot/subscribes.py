@@ -32,6 +32,8 @@ class SubscriptionItem:
     name: str
     year: str = ''
     seasons: list[int] = field(default_factory=list)
+    # 存在「整部剧」订阅（season=0）时，季限制失效，全部季都算在追
+    all_seasons: bool = False
 
 
 def _get(obj: Any, name: str, default: Any = None) -> Any:
@@ -134,6 +136,8 @@ def collect(
 
         season = _get(item, 'season', None)
         season_no = _to_int(season, -1) if season is not None else -1
+        # 订阅里 season=0 表示整部剧（全部季），不是「第 0 季」
+        season_no = season_no if season_no > 0 else -1
 
         exist = grouped.get(tmdb_id)
         if exist is None:
@@ -141,12 +145,20 @@ def collect(
                 tmdb_id=tmdb_id,
                 name=name,
                 year=str(_get(item, 'year', '') or ''),
-                seasons=[season_no] if season_no >= 0 else [],
+                seasons=[season_no] if season_no > 0 else [],
+                all_seasons=season_no <= 0,
             )
-        elif season_no >= 0 and season_no not in exist.seasons:
-            exist.seasons.append(season_no)
+        elif season_no > 0:
+            if season_no not in exist.seasons:
+                exist.seasons.append(season_no)
+        else:
+            # 同一部剧同时订了「整部剧」和「某一季」，按整部剧算
+            exist.all_seasons = True
 
     shows = list(grouped.values())
+    for item in shows:
+        if item.all_seasons:
+            item.seasons = []
     shows.sort(key=lambda row: row.name)
     return shows, skipped
 

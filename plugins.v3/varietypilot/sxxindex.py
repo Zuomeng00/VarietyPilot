@@ -16,7 +16,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .titles import ParsedTitle, detect_subtype, parse_release, parse_title, strip_show_name
 
@@ -526,15 +526,26 @@ def rank_specials(
     index: SpecialIndex,
     air_date: Optional[date] = None,
     limit: int = 8,
+    seasons: Optional[Iterable[int]] = None,
 ) -> list[MatchResult]:
     """返回按分数降序的候选集列表，供落位环节挑一个没被占用的集号。
 
     只返回达到最低门槛的结果；分数相近的若干条都会保留，
     因为同一期往往有多个片段集，单看一条资源的信号分不出是哪一段。
+
+    :param seasons: 只看这些季的特别集。订阅只追第 4 季时，第 1~3 季的
+        加更不该出现在候选里，否则落位会被老季的集抢走。
     """
     if not index.episodes:
         return []
-    scored = [score_episode(target, episode, index, target_date=air_date) for episode in index.episodes]
+    episodes = index.episodes
+    allowed = {int(item) for item in (seasons or []) if item is not None and int(item) > 0}
+    if allowed:
+        # 集名没写季号的不做限制，无法判断就别误杀
+        episodes = [item for item in episodes if item.season is None or item.season in allowed]
+        if not episodes:
+            return []
+    scored = [score_episode(target, episode, index, target_date=air_date) for episode in episodes]
     scored = [item for item in scored if item.score > -50]
     if not scored:
         return []

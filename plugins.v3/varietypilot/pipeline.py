@@ -37,7 +37,29 @@ class TrackedShow:
     year: str = ''
     sites: list[int] = field(default_factory=list)
     aliases: list[str] = field(default_factory=list)
+    # 只下这几季的衍生内容。空列表表示不限，按订阅里的季号填充。
+    # 订阅「现在就出发 第四季」时，前几季的加更、纯享都不该跟着下。
+    seasons: list[int] = field(default_factory=list)
     enabled: bool = True
+
+    @property
+    def season_label(self) -> str:
+        seasons = sorted({item for item in self.seasons if item is not None and item > 0})
+        if not seasons:
+            return '全部季'
+        return '第' + '、'.join(str(item) for item in seasons) + '季'
+
+    def allows_season(self, season: Optional[int]) -> bool:
+        """这条资源所属的季是否在跟踪范围内。
+
+        两种情况一律放行：
+        1. 季号取不到——站点和 TMDB 都可能没写，宁可交给匹配分判断；
+        2. 四位数季号（S2025）——那是年份写法，不是节目第几季。
+        """
+        seasons = {item for item in self.seasons if item is not None and item > 0}
+        if not seasons or season is None or season >= 1900:
+            return True
+        return season in seasons
 
     @property
     def search_names(self) -> list[str]:
@@ -279,11 +301,14 @@ def build_candidates(
     show: TrackedShow,
     index: SpecialIndex,
     require_subtype: bool = True,
+    season_filtered: Optional[list[str]] = None,
 ) -> tuple[list[Candidate], int, int, list[tuple[str, ParsedTitle]]]:
     """把搜索结果转成候选列表。
 
     资源名给站点编号，站点副标题给中文期号与衍生类型，两者合并解析。
 
+    :param season_filtered: 非空时，把因季号不符被排除的资源标题写进去，
+        供扫描结果说明「为什么这一季的加更没下」。
     :return: (候选, 衍生条数, 成功匹配条数, 未匹配的衍生标题及解析结果)
     """
     names = show.search_names
@@ -303,9 +328,14 @@ def build_candidates(
         # 先解析一次，再一次性拿到该资源可落位的全部候选集号，
         # 落位环节需要在候选之间做取舍，只取最高分一条会导致多条资源撞同一集。
         parsed = parse_release(strip_show_name(title, names), strip_show_name(description, names))
-        options = rank_specials(parsed, index)
-        result = options[0] if options else None
         is_derived = parsed.subtype is not None
+        # 订阅只追第 4 季时，前几季的加更/纯享不该跟着下
+        if not show.allows_season(parsed.season):
+            if is_derived and season_filtered is not None:
+                season_filtered.append(title)
+            continue
+        options = rank_specials(parsed, index, seasons=show.seasons)
+        result = options[0] if options else None
         if is_derived:
             derived += 1
         if result is None:
@@ -658,7 +688,10 @@ def scan_show(
     if not contexts:
         return report
 
-    candidates, report.derived_found, report.matched, unmatched = build_candidates(contexts, show, index)
+    season_filtered: list[str] = []
+    candidates, report.derived_found, report.matched, unmatched = build_candidates(
+        contexts, show, index, season_filtered=season_filtered
+    )
 
     # 先按体积/做种筛掉不合规的资源，再做落位分配。
     # 顺序不能反：被筛掉的资源如果先占了集号，会让合规资源被迫挤到下一集。
@@ -737,6 +770,11 @@ def scan_show(
                 }
             )
         head_lines.append(f'{len(unmatched)} 条衍生内容在 TMDB 特别季中暂无对应集，已记录等待')
+
+    if season_filtered:
+        head_lines.append(
+            f'订阅只追{show.season_label}，已排除其他季的衍生内容 {len(season_filtered)} 条'
+        )
 
     chosen, skipped, _winners = plan_tasks(candidates, store, show, options)
     skipped.extend(assign_skipped)
