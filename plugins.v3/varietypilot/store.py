@@ -49,6 +49,9 @@ class Task:
     site: str = ''
     size: int = 0
     seeders: int = 0
+    # 内容指纹：同一份内容的不同清晰度、不同站点版本共用同一个值。
+    # 集号会因 TMDB 补录而整体后移，靠集号判断重复不可靠，只能靠指纹。
+    content_key: str = ''
     download_hash: str = ''
     status: str = STATUS_QUEUED
     verify: str = VERIFY_UNKNOWN
@@ -231,6 +234,29 @@ class TaskStore:
             for task in self._tasks.values():
                 if task.download_hash and task.download_hash == download_hash:
                     return task
+        return None
+
+    def find_by_content(
+        self,
+        tmdb_id: int,
+        content_key: str,
+        statuses: Optional[Iterable[str]] = None,
+    ) -> Optional[Task]:
+        """按内容指纹反查任务。
+
+        TMDB 特别季会不断补录，同一份内容的集号可能整体后移；
+        只有指纹能确认「这份内容已经下过了」，避免换清晰度或换集号重复下载。
+        """
+        if not content_key:
+            return None
+        wanted = set(statuses) if statuses else None
+        with self._lock:
+            for task in self._tasks.values():
+                if task.tmdb_id != tmdb_id or task.content_key != content_key:
+                    continue
+                if wanted and task.status not in wanted:
+                    continue
+                return task
         return None
 
     def pending_transfer(self, tmdb_id: int) -> list[Task]:

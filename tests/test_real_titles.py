@@ -224,17 +224,17 @@ def test_scan_end_to_end() -> None:
             show=SHOW_JXCF,
             index=JXCF_INDEX,
             store=store,
-            options=Options(min_seeders=1, min_size_gb=0.05, max_size_gb=20.0),
+            options=Options(min_seeders=1, min_size_gb=0.05, max_size_gb=20.0, prefer_resolution='2160p'),
             search_fn=lambda name, sites: contexts if name in ('Natural High', '现在就出发') else [],
             download_fn=lambda candidate: (submitted.append(candidate.title) or (True, 'hash123')),
         )
         assert report.submitted == 1, f'应只提交 1 条，实际 {report.submitted}'
-        assert submitted[0].endswith('2160p TX WEB-DL H265 DDP2.0-ADWeb'), '应优先选择免费种'
+        assert submitted[0].endswith('2160p TX WEB-DL H265 DDP2.0-ADWeb'), '偏好 2160p 时应选 2160p'
         task = store.get(231620, 113)
         assert task is not None, '任务未落库'
         assert task.src_site_episode == 8 and task.src_episode == 4, '站点编号与真实期号未分别记录'
         assert task.download_hash == 'hash123'
-    print('扫描链路通过：免费优先、正片排除、站点编号与期号分别记录')
+    print('扫描链路通过：清晰度优先、正片排除、站点编号与期号分别记录')
 
 
 if __name__ == '__main__':

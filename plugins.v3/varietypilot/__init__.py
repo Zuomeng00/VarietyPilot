@@ -102,6 +102,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'sync_subscribe': True,
     'sync_scope': 'variety',
     'sync_exclude': '',
+    'sync_interval_minutes': 30,
     'min_seeders': 1,
     'min_size_gb': 0.05,
     'max_size_gb': 20.0,
@@ -162,7 +163,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.2'
+    plugin_version = '2.1.3'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -417,6 +418,22 @@ class VarietyPilot(_PluginBase):
             note += f'，{len(skipped)} 部类型未知已跳过'
         return len(self._auto_shows), note
 
+    def _sync_interval_minutes(self) -> int:
+        """订阅同步间隔（分钟）。0 表示每轮扫描都同步。"""
+        value = _to_int(self._config.get('sync_interval_minutes'), 30)
+        return max(0, min(value, 24 * 60))
+
+    def _sync_due(self) -> bool:
+        """是否到了该同步订阅的时间。
+
+        订阅列表变化很慢，没必要跟着扫描周期反复拉取：MP 端每同步一次都要
+        挨个查 TMDB 类型，站点多、订阅多时开销不小，还会刷屏。
+        """
+        interval = self._sync_interval_minutes()
+        if interval <= 0 or self._sync_at <= 0:
+            return True
+        return (time.time() - self._sync_at) >= interval * 60
+
     @staticmethod
     def site_catalog() -> List[Dict[str, Any]]:
         """列出宿主已接入的站点，供填写「限定站点 ID」时对照。
@@ -506,6 +523,8 @@ class VarietyPilot(_PluginBase):
     def _first_sync(self) -> None:
         if not self._enabled:
             return
+        if not self._sync_due():
+            return
         try:
             count, note = self.refresh_subscriptions()
             logger.info(f'综艺衍生内容管家：{note}')
@@ -524,18 +543,31 @@ class VarietyPilot(_PluginBase):
             return
         self.run_scan(dry_run=_to_bool(self._config.get('dry_run'), True))
 
-    def run_scan(self, dry_run: Optional[bool] = None, only_show: str = '') -> Tuple[int, str]:
+    def run_scan(
+        self,
+        dry_run: Optional[bool] = None,
+        only_show: str = '',
+        force_sync: bool = False,
+    ) -> Tuple[int, str]:
         """执行一轮扫描，返回 (提交数量, 文本汇总)。"""
         if self._store is None or self._index_store is None:
             return 0, '插件尚未初始化，请先保存配置'
 
         sync_note = ''
         if _to_bool(self._config.get('sync_subscribe'), True):
-            try:
-                _, sync_note = self.refresh_subscriptions()
-            except Exception as err:  # noqa: BLE001
-                sync_note = f'订阅同步失败：{err}'
-                logger.warning(f'综艺衍生内容管家：{sync_note}')
+            if force_sync or self._sync_due():
+                try:
+                    _, sync_note = self.refresh_subscriptions()
+                except Exception as err:  # noqa: BLE001
+                    sync_note = f'订阅同步失败：{err}'
+                    logger.warning(f'综艺衍生内容管家：{sync_note}')
+            else:
+                interval = self._sync_interval_minutes()
+                left = max(0, interval * 60 - (time.time() - self._sync_at))
+                logger.debug(
+                    f'综艺衍生内容管家：订阅同步未到期（间隔 {interval} 分钟，'
+                    f'还需 {left / 60:.0f} 分钟），本轮跳过'
+                )
 
         if not self._shows:
             return 0, sync_note or '未配置跟踪剧集，请在插件设置里填写「剧名|TMDB ID」'
@@ -1212,6 +1244,22 @@ class VarietyPilot(_PluginBase):
                                 'props': {'cols': 12, 'md': 4},
                                 'content': [
                                     {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'sync_interval_minutes',
+                                            'label': '订阅同步间隔(分钟)',
+                                            'type': 'number',
+                                            'hint': '默认 30 分钟；0 表示每轮扫描都同步',
+                                            'persistent-hint': True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
                                         'component': 'VSelect',
                                         'props': {
                                             'model': 'sync_scope',
@@ -1226,6 +1274,11 @@ class VarietyPilot(_PluginBase):
                                     }
                                 ],
                             },
+                        ],
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
                             {
                                 'component': 'VCol',
                                 'props': {'cols': 12, 'md': 4},
@@ -1642,6 +1695,8 @@ class VarietyPilot(_PluginBase):
                 if self._sync_at
                 else '尚未同步'
             )
+            interval = self._sync_interval_minutes()
+            cadence = f'每 {interval} 分钟同步' if interval > 0 else '每轮扫描都同步'
             content.append(
                 {
                     'component': 'VAlert',
@@ -1651,7 +1706,7 @@ class VarietyPilot(_PluginBase):
                         'density': 'compact',
                         'class': 'mb-2',
                         'text': (
-                            f'上次同步：{last} ｜ 订阅识别 {len(self._auto_shows)} 部 ｜ '
+                            f'上次同步：{last} ｜ {cadence} ｜ 订阅识别 {len(self._auto_shows)} 部 ｜ '
                             f'手动配置 {len(self._manual_shows)} 部 ｜ '
                             f'范围：{"仅综艺" if str(self._config.get("sync_scope") or "variety") != "all" else "全部电视剧"}'
                         ),

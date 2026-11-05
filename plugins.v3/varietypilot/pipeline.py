@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 
 from .sxxindex import MIN_ACCEPT_SCORE, MatchResult, SpecialIndex, rank_specials
 from .store import (
+    STATUS_DONE,
     STATUS_QUEUED,
     STATUS_SKIPPED,
     STATUS_SUBMITTED,
@@ -83,11 +84,13 @@ class Candidate:
     options: list[MatchResult] = field(default_factory=list)
 
     @property
-    def resolution_rank(self) -> int:
+    def resolution(self) -> str:
         found = _RE_RESOLUTION.search(self.title)
-        if not found:
-            return 0
-        return _RESOLUTION_RANK.get(found.group(1).lower(), 0)
+        return found.group(1).lower() if found else ''
+
+    @property
+    def resolution_rank(self) -> int:
+        return _RESOLUTION_RANK.get(self.resolution, 0)
 
     @property
     def size_gb(self) -> float:
@@ -237,9 +240,11 @@ def _context_hash(context: Any) -> str:
 
 
 def rank_key(candidate: Candidate, prefer_resolution: str = '1080p') -> tuple:
-    """择优排序：免费优先 → 目标清晰度 → 做种数 → 体积（小者优先）。
+    """择优排序：目标清晰度 → 免费 → 做种数 → 体积（小者优先）。
 
-    PT 站点流量金贵，同一集有免费种时优先抓免费。
+    清晰度必须排在最前面。旧版把「免费」当第一优先级，结果填了 2160p
+    却因为 1080p 是免费种而选中 1080p；等 2160p 后来变成免费，又下一遍，
+    同一份内容就成了两个版本。用户显式选了清晰度，就按清晰度来。
     """
     prefer_rank = _RESOLUTION_RANK.get(prefer_resolution.lower(), 3)
     # 与偏好一致得 0，高于偏好得 1（宁可要 1080p 而不是 2160p 的加更），低于偏好得 2
@@ -251,7 +256,7 @@ def rank_key(candidate: Candidate, prefer_resolution: str = '1080p') -> tuple:
         resolution_score = 2
     else:
         resolution_score = 3
-    return (0 if candidate.free else 1, resolution_score, -candidate.seeders, candidate.size or 0)
+    return (resolution_score, 0 if candidate.free else 1, -candidate.seeders, candidate.size or 0)
 
 
 def filter_candidate(candidate: Candidate, options: Options) -> Optional[str]:
@@ -332,25 +337,79 @@ def build_candidates(
     return candidates, derived, matched, unmatched
 
 
-def _source_key(candidate: Candidate) -> tuple:
-    """同一条资源的身份标识。
+def _content_base(candidate: Candidate) -> tuple:
+    """内容的「同一段」基础描述：季 + 类型 + 修饰词 + 分P。
 
-    优先按「季 + 类型 + 修饰词 + 分P + 片段名」认内容：不同站点的同一条资源、
-    同一条资源的 1080p/2160p 两个版本，都指向同一份内容，必须落到同一个特别集号。
-    没有片段名时才退回站点季集号。
+    刻意不含清晰度——1080p 与 2160p 是同一份内容的不同版本，
+    必须归到一起再挑一条，否则两个版本会各占一个集号、重复下载。
     """
     parsed = candidate.parsed
     season = parsed.site_season if parsed.site_season is not None else parsed.season
-    # 有真实期号时，期号本身就能唯一确定内容（同期同类型同修饰词同分P即同一段）
-    if parsed.episode is not None and not parsed.episode_is_site_ordinal:
-        return ('period', season, parsed.episode, parsed.subtype or '', parsed.modifier or '',
-                parsed.part or '', parsed.segment or '')
-    # 只有站点序号时，片段名是唯一可用的内容标识
-    if parsed.segment and (parsed.subtype or parsed.modifier):
-        return ('segment', season, parsed.subtype or '', parsed.modifier or '',
-                parsed.part or '', parsed.segment.strip())
-    episode = parsed.site_episode if parsed.site_episode is not None else parsed.episode
-    return ('ordinal', season, episode, parsed.subtype or '', parsed.modifier or '', parsed.part or '')
+    return (season, parsed.subtype or '', parsed.modifier or '', parsed.part or '')
+
+
+def _ordinal(candidate: Candidate) -> Optional[int]:
+    """站点发布序号。同一份内容的各清晰度版本共用同一个序号。"""
+    parsed = candidate.parsed
+    if parsed.site_episode is not None:
+        return parsed.site_episode
+    if parsed.episode is not None and parsed.episode_is_site_ordinal:
+        return parsed.episode
+    return None
+
+
+def _group_keys(candidate: Candidate) -> list[tuple]:
+    """可用于判定「同一份内容」的键，命中任意一个就归为一组。
+
+    1. 站点发布序号：同站同一条资源的 1080p/2160p 共用，最可靠；
+    2. 片段名：不同站点各编各的号，但纯享片段的副标题带名字，名字相同即同一段。
+    """
+    base = _content_base(candidate)
+    keys: list[tuple] = []
+    ordinal = _ordinal(candidate)
+    if ordinal is not None:
+        keys.append(base + ('ord', ordinal))
+    segment = (candidate.parsed.segment or '').strip()
+    if segment:
+        keys.append(base + ('seg', segment))
+    if not keys:
+        episode = candidate.parsed.episode
+        keys.append(base + ('episode', episode))
+    return keys
+
+
+def content_key(candidate: Candidate) -> str:
+    """写入任务的持久化指纹：跨扫描轮次判断「这份内容下过没有」。"""
+    return '|'.join(str(item) for item in _group_keys(candidate)[0])
+
+
+def _group_candidates(candidates: list[Candidate]) -> list[list[Candidate]]:
+    """按内容把候选归组（并查集）。
+
+    同一份内容可能有多条资源：1080p、2160p、不同站点各一条。
+    它们的集号归属必须一起决定，否则会各占一个集号，重复下载同一样东西。
+    """
+    parent = list(range(len(candidates)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    owner: dict[tuple, int] = {}
+    for index, candidate in enumerate(candidates):
+        for key in _group_keys(candidate):
+            first = owner.setdefault(key, index)
+            if first != index:
+                left, right = find(first), find(index)
+                if left != right:
+                    parent[right] = left
+
+    groups: dict[int, list[Candidate]] = {}
+    for index, candidate in enumerate(candidates):
+        groups.setdefault(find(index), []).append(candidate)
+    return list(groups.values())
 
 
 def _source_order(candidate: Candidate) -> tuple:
@@ -376,15 +435,11 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
     单看一条资源分不出是哪一段。若各自独立取最高分，它们会全部撞到同一集。
 
     规则：
-    1. 同一条资源（同站点编号）的多个版本归为一组，整组落到同一集；
+    1. 同一份内容（同站点序号、或同名片段）的多个版本归为一组，整组落到同一集；
     2. 组按站点发布顺序依次挑分最高、且尚未被占用的集号；
     3. 一个集号只给一组，宁可让多出来的资源「等待」，也不重复落位。
     """
-    groups: dict[tuple, list[Candidate]] = {}
-    for candidate in candidates:
-        groups.setdefault(_source_key(candidate), []).append(candidate)
-
-    ordered = sorted(groups.values(), key=lambda items: _source_order(items[0]))
+    ordered = sorted(_group_candidates(candidates), key=lambda items: _source_order(items[0]))
     used: set[int] = set()
     chosen: list[Candidate] = []
     skipped: list[tuple[Candidate, str]] = []
@@ -417,6 +472,7 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
         for item in items:
             item.match = pick
             chosen.append(item)
+
     return chosen, skipped
 
 
@@ -441,7 +497,7 @@ def plan_tasks(
     winners: dict[int, Candidate] = {}
     for episode, items in grouped.items():
         existing = store.get(show.tmdb_id, episode)
-        if existing and existing.status in (STATUS_SUBMITTED, STATUS_QUEUED, 'done'):
+        if existing and existing.status in (STATUS_SUBMITTED, STATUS_QUEUED, STATUS_DONE):
             if not options.overwrite_existing:
                 for item in items:
                     skipped.append(
@@ -452,7 +508,17 @@ def plan_tasks(
         chosen.append(best)
         winners[episode] = best
         for other in items:
-            if other is not best:
+            if other is best:
+                continue
+            if other.resolution and best.resolution and other.resolution != best.resolution:
+                skipped.append(
+                    (
+                        other,
+                        f'S00E{episode:02d} 同一内容已选 {best.resolution} 版本，'
+                        f'跳过 {other.resolution}（偏好 {options.prefer_resolution}）',
+                    )
+                )
+            else:
                 skipped.append(
                     (other, f'S00E{episode:02d} 同集多条资源，已选《{best.title}》')
                 )
@@ -478,6 +544,7 @@ def make_task(candidate: Candidate, show: TrackedShow) -> Task:
         site=candidate.site,
         size=candidate.size,
         seeders=candidate.seeders,
+        content_key=content_key(candidate),
         match_score=candidate.match.score,
     )
 
@@ -534,6 +601,27 @@ def scan_show(
             pre_skipped.append((candidate, reason))
         else:
             eligible.append(candidate)
+
+    # 按内容指纹去掉已经下过的：TMDB 补录会让集号整体后移，
+    # 只按集号判断的话，同一份内容的另一个清晰度会被当成新内容再下一遍。
+    fresh: list[Candidate] = []
+    for candidate in eligible:
+        existing = store.find_by_content(
+            show.tmdb_id,
+            content_key(candidate),
+            statuses=(STATUS_SUBMITTED, STATUS_QUEUED, STATUS_DONE),
+        )
+        if existing and not options.overwrite_existing:
+            pre_skipped.append(
+                (
+                    candidate,
+                    f'该内容已下载过（{existing.target_label}《{existing.sxx_name}》），'
+                    f'不重复下载；如需换版本请先删除这条任务记录',
+                )
+            )
+        else:
+            fresh.append(candidate)
+    eligible = fresh
 
     # 多条资源撞同一集时按发布顺序重新分配，保证一条资源落一个集号
     candidates, assign_skipped = assign_episodes(eligible)
