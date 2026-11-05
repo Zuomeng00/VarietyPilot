@@ -243,6 +243,35 @@ def test_resolution_beats_free() -> None:
         assert '2160p' in submitted[0], f'应选 2160p，实际 {submitted[0]}'
 
 
+def test_legacy_task_without_fingerprint() -> None:
+    """升级前的任务没有内容指纹，只能按站点序号判重，同样不能重复下载。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = TaskStore(Path(tmp) / 'tasks.json')
+        first: list[str] = []
+        _run(
+            store,
+            INDEX_BASE,
+            [FakeContext('Natural High S04E07 Plus 2026 1080p TX WEB-DL H265 AAC-ADWeb',
+                         '现在就出发 第四季 加更 第04期加更：沈腾黄景瑜双簧帮唱')],
+            first,
+        )
+        assert len(first) == 1, first
+        for task in store.all():
+            store.update(task, content_key='')  # 模拟 2.1.2 留下的旧记录
+
+        second: list[str] = []
+        report = _run(
+            store,
+            INDEX_BASE,
+            [FakeContext('Natural High S04E07 Plus 2026 2160p TX WEB-DL H265 DDP2.0-ADWeb',
+                         '现在就出发 第四季 加更 第04期加更：沈腾黄景瑜双簧帮唱')],
+            second,
+        )
+        assert second == [], f'旧记录也要挡住重复下载：{second}'
+        reasons = [r['reason'] for r in report.records if r['status'] == '跳过']
+        assert any('已下载过' in line for line in reasons), reasons
+
+
 def test_sync_interval_gate() -> None:
     """订阅同步按间隔节流：默认 30 分钟，0 表示每轮都同步。"""
     plugin = VarietyPilot()
@@ -275,6 +304,7 @@ if __name__ == '__main__':
     check('新内容照常下载', test_new_content_still_downloaded)
     check('指纹与清晰度无关', test_content_key_ignores_resolution)
     check('清晰度优先于免费', test_resolution_beats_free)
+    check('升级前的旧记录也能挡住重复', test_legacy_task_without_fingerprint)
     check('同步间隔节流', test_sync_interval_gate)
     check('同步间隔默认 30 分钟', test_sync_interval_default)
     print('全部通过：重复下载拦截 + 同步节流')

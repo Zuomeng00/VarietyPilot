@@ -259,6 +259,33 @@ class TaskStore:
                 return task
         return None
 
+    def find_by_ordinal(
+        self,
+        tmdb_id: int,
+        season: Optional[int],
+        episode: Optional[int],
+        statuses: Optional[Iterable[str]] = None,
+    ) -> Optional[Task]:
+        """按站点发布序号反查任务。
+
+        升级前的任务记录没有内容指纹，只能靠站点序号判定「这份内容下过了」。
+        同一份内容的 1080p/2160p 共用同一个序号，不同片段各有各的序号，用它判重不会误伤。
+        """
+        if episode is None:
+            return None
+        wanted = set(statuses) if statuses else None
+        with self._lock:
+            for task in self._tasks.values():
+                if task.tmdb_id != tmdb_id or task.src_site_episode != episode:
+                    continue
+                if season is not None and task.src_site_season is not None:
+                    if task.src_site_season != season:
+                        continue
+                if wanted and task.status not in wanted:
+                    continue
+                return task
+        return None
+
     def pending_transfer(self, tmdb_id: int) -> list[Task]:
         with self._lock:
             return [

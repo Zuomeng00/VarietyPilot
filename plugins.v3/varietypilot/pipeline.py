@@ -604,13 +604,17 @@ def scan_show(
 
     # 按内容指纹去掉已经下过的：TMDB 补录会让集号整体后移，
     # 只按集号判断的话，同一份内容的另一个清晰度会被当成新内容再下一遍。
+    done_status = (STATUS_SUBMITTED, STATUS_QUEUED, STATUS_DONE)
     fresh: list[Candidate] = []
     for candidate in eligible:
-        existing = store.find_by_content(
-            show.tmdb_id,
-            content_key(candidate),
-            statuses=(STATUS_SUBMITTED, STATUS_QUEUED, STATUS_DONE),
-        )
+        existing = store.find_by_content(show.tmdb_id, content_key(candidate), statuses=done_status)
+        if existing is None:
+            # 升级前的任务记录没有指纹，退回按站点序号判断
+            parsed = candidate.parsed
+            season = parsed.site_season if parsed.site_season is not None else parsed.season
+            existing = store.find_by_ordinal(
+                show.tmdb_id, season, _ordinal(candidate), statuses=done_status
+            )
         if existing and not options.overwrite_existing:
             pre_skipped.append(
                 (
