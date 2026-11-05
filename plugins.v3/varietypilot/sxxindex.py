@@ -42,8 +42,9 @@ MIN_ACCEPT_SCORE = 6.0
 
 # 类型相近关系：命中同一个「族」时给部分分
 SUBTYPE_NEIGHBORS: dict[str, set[str]] = {
-    'plus_bonus': {'bonus', 'pure'},
-    'bonus': {'plus_bonus', 'pure'},
+    'plus_bonus': {'bonus', 'pure', 'uncut'},
+    'bonus': {'plus_bonus', 'pure', 'uncut'},
+    'uncut': {'plus_bonus', 'bonus'},
     'pure': {'plus_bonus', 'bonus'},
     'special': {'extra'},
     'extra': {'special', 'live'},

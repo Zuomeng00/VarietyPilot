@@ -101,7 +101,7 @@ def test_only_subscribed_season() -> None:
         report = _run(show, [CTX_OLD, CTX_NEW], submitted, store)
         assert len(submitted) == 1, f'只该下第四季，实际 {submitted}'
         assert 'S04E07' in submitted[0], submitted
-        assert 'S00E166' in report.details[-1] or any('第四季' in line for line in report.details), report.details
+        assert any('S00E166' in line for line in report.details), report.details
         assert any('已排除其他季' in line for line in report.details), report.details
 
 

@@ -88,7 +88,7 @@ from .store import (
 )
 from .sxxindex import SpecialIndexStore, subtypes_compatible
 from .subscribes import TmdbGenreChecker, VarietyCache, collect, list_tv_subscriptions
-from .titles import SUBTYPE_LABELS, parse_title, subtype_label
+from .titles import SUBTYPE_HINTS, SUBTYPE_LABELS, parse_title, subtype_label
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'refresh_library': True,
     'overwrite_existing': False,
     'guard_unmatched': False,
+    'skip_subtypes': ['clip'],
     'index_ttl_hours': 12,
 }
 
@@ -163,7 +164,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.6'
+    plugin_version = '2.1.7'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -215,6 +216,7 @@ class VarietyPilot(_PluginBase):
             max_size_gb=_to_float(merged.get('max_size_gb'), 20.0),
             prefer_resolution=str(merged.get('prefer_resolution') or '1080p'),
             overwrite_existing=_to_bool(merged.get('overwrite_existing')),
+            skip_subtypes=self._parse_subtypes(merged.get('skip_subtypes')),
         )
         self._manual_shows = self._parse_shows(
             str(merged.get('shows') or ''), merged.get('site_ids')
@@ -277,6 +279,30 @@ class VarietyPilot(_PluginBase):
             if value > 0 and value not in seasons:
                 seasons.append(value)
         return seasons
+
+    @staticmethod
+    def _parse_subtypes(raw: Any) -> List[str]:
+        """「不下载的类型」配置：认类型键（clip）、中文标签（直拍），也认逗号分隔字符串。
+
+        站点和平台的叫法不统一，用户手填时多半会写中文，
+        所以两种写法都要能落到同一个类型键上，否则开关看着开了却不起作用。
+        """
+        if raw is None:
+            return []
+        if isinstance(raw, (list, tuple, set)):
+            values = [str(item) for item in raw]
+        else:
+            values = re.split(r'[,，、/\s]+', str(raw).strip())
+        by_label = {label: key for key, label in SUBTYPE_LABELS.items()}
+        result: List[str] = []
+        for item in values:
+            key = item.strip()
+            if not key:
+                continue
+            canonical = key if key in SUBTYPE_LABELS else by_label.get(key, '')
+            if canonical and canonical not in result:
+                result.append(canonical)
+        return result
 
     @classmethod
     def _parse_shows(cls, text: str, site_raw: Any) -> List[TrackedShow]:
@@ -1239,6 +1265,28 @@ class VarietyPilot(_PluginBase):
             items.append({'title': f'未知站点（{site_id}）', 'value': site_id})
         return items
 
+    @staticmethod
+    def _subtype_items() -> List[Dict[str, Any]]:
+        """「不下载的类型」下拉选项。
+
+        每项都带上这类在国内平台上的常见叫法，站点换个词也知道该关哪一项。
+        顺序按「正片衍生 → 个人视角 → 预热 → 整期新内容 → 独立衍生」排，
+        不跟着字典顺序漂移，免得每次改词表下拉顺序都变。
+        """
+        order = [
+            'plus_bonus', 'pure', 'bonus', 'uncut',
+            'clip', 'prequel', 'special', 'live', 'extra',
+        ]
+        return [
+            {
+                'title': SUBTYPE_LABELS[key],
+                'subtitle': SUBTYPE_HINTS.get(key, ''),
+                'value': key,
+            }
+            for key in order
+            if key in SUBTYPE_LABELS
+        ]
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
             {
@@ -1450,6 +1498,35 @@ class VarietyPilot(_PluginBase):
                     {
                         'component': 'VRow',
                         'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'skip_subtypes',
+                                            'label': '不下载的衍生类型',
+                                            'items': self._subtype_items(),
+                                            'multiple': True,
+                                            'chips': True,
+                                            'closable-chips': True,
+                                            'clearable': True,
+                                            'hint': (
+                                                '选中的类型整类跳过，不搜索落位也不下载；清空表示全部都要。'
+                                                '默认跳过「直拍」——单人机位素材的站点文件名不带人名，'
+                                                '只能按发布时间猜是哪位嘉宾，容易对错人。'
+                                            ),
+                                            'persistent-hint': True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
                             self._switch('guard_unmatched', '未接管资源也强制进特别季', 6),
                             {
                                 'component': 'VCol',
@@ -1504,6 +1581,11 @@ class VarietyPilot(_PluginBase):
             ],
         }
 
+    def _skip_label(self) -> str:
+        """概况页显示当前关掉的类型，省得去设置页确认开关到底生没生效。"""
+        names = [SUBTYPE_LABELS.get(item, item) for item in self._options.skip_subtypes]
+        return '、'.join(names) if names else '全部下载'
+
     # ------------------------------------------------------------------- 页面
 
     def get_page(self) -> List[dict]:
@@ -1524,6 +1606,7 @@ class VarietyPilot(_PluginBase):
                     else '尚未扫描',
                 ),
                 ('预演模式', '开' if _to_bool(self._config.get('dry_run'), True) else '关'),
+                ('不下载的类型', self._skip_label()),
             ],
         )
 

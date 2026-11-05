@@ -27,7 +27,7 @@ from .store import (
     Task,
     TaskStore,
 )
-from .titles import ParsedTitle, parse_release, strip_show_name, subtype_label
+from .titles import SUBTYPE_LABELS, ParsedTitle, parse_release, strip_show_name, subtype_label
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,8 @@ class Options:
     prefer_resolution: str = '1080p'
     allow_partial: bool = True       # 允许上/下集分别落位
     overwrite_existing: bool = False
+    # 不要下载的衍生类型，取值见 titles.SUBTYPE_LABELS 的键（如 'clip' 直拍）
+    skip_subtypes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -332,6 +334,8 @@ def build_candidates(
     index: SpecialIndex,
     require_subtype: bool = True,
     season_filtered: Optional[list[str]] = None,
+    skip_subtypes: Optional[list[str]] = None,
+    type_filtered: Optional[list[str]] = None,
 ) -> tuple[list[Candidate], int, int, list[tuple[str, ParsedTitle]]]:
     """把搜索结果转成候选列表。
 
@@ -339,9 +343,12 @@ def build_candidates(
 
     :param season_filtered: 非空时，把因季号不符被排除的资源标题写进去，
         供扫描结果说明「为什么这一季的加更没下」。
+    :param skip_subtypes: 用户关掉的衍生类型；命中的资源一律不收。
+    :param type_filtered: 非空时，把因类型被关掉而排除的资源标题写进去。
     :return: (候选, 衍生条数, 成功匹配条数, 未匹配的衍生标题及解析结果)
     """
     names = show.search_names
+    blocked = {item for item in (skip_subtypes or []) if item}
     candidates: list[Candidate] = []
     unmatched: list[tuple[str, ParsedTitle]] = []
     derived = 0
@@ -359,6 +366,12 @@ def build_candidates(
         # 落位环节需要在候选之间做取舍，只取最高分一条会导致多条资源撞同一集。
         parsed = parse_release(strip_show_name(title, names), strip_show_name(description, names))
         is_derived = parsed.subtype is not None
+        # 用户关掉的类型（例如直拍）连解析后的落位都不做，直接排除。
+        # 放在季号判断之前：类型比季更硬，先判类型能少一次无用匹配。
+        if parsed.subtype and parsed.subtype in blocked:
+            if type_filtered is not None:
+                type_filtered.append(title)
+            continue
         # 订阅只追第 4 季时，前几季的加更/纯享不该跟着下
         if not show.allows_season(parsed.season):
             if is_derived and season_filtered is not None:
@@ -735,13 +748,31 @@ def scan_show(
             report.details.append(f'{show.name}：搜索「{name}」失败 {err}')
             logger.warning(f'综艺衍生内容管家：搜索 {name} 失败：{err}')
 
+    # 中文名和英文别名会各返回同一批资源，不去重的话同一份内容会进两次候选：
+    # 多占一个落位名额，最后报成「同集多条资源」，统计条数也翻倍。
+    unique: list[Any] = []
+    seen_contexts: set[tuple] = set()
+    for context in contexts:
+        key = (_context_title(context), _context_site(context), _context_size(context))
+        if key in seen_contexts:
+            continue
+        seen_contexts.add(key)
+        unique.append(context)
+    contexts = unique
+
     report.searched = len(contexts)
     if not contexts:
         return report
 
     season_filtered: list[str] = []
+    type_filtered: list[str] = []
     candidates, report.derived_found, report.matched, unmatched = build_candidates(
-        contexts, show, index, season_filtered=season_filtered
+        contexts,
+        show,
+        index,
+        season_filtered=season_filtered,
+        skip_subtypes=options.skip_subtypes,
+        type_filtered=type_filtered,
     )
 
     # 先按体积/做种筛掉不合规的资源，再做落位分配。
@@ -826,6 +857,12 @@ def scan_show(
         head_lines.append(
             f'订阅只追{show.season_label}，已排除其他季的衍生内容 {len(season_filtered)} 条'
         )
+
+    if type_filtered:
+        labels = '、'.join(
+            SUBTYPE_LABELS.get(item, item) for item in options.skip_subtypes if item
+        )
+        head_lines.append(f'已按设置跳过「{labels}」{len(type_filtered)} 条')
 
     chosen, skipped, _winners = plan_tasks(candidates, store, show, options)
     skipped.extend(assign_skipped)
