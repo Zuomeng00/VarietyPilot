@@ -164,7 +164,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.7'
+    plugin_version = '2.1.8'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -1033,7 +1033,7 @@ class VarietyPilot(_PluginBase):
 
         判据只有两条，都很硬：
         1. 文件名能解析出衍生类型（加更/彩蛋/Plus/Special 等）；
-        2. 文件名与任务记录的种子名完全一致（只是补了扩展名）。
+        2. 文件名与任务记录的种子名对得上。
 
         为什么不用模糊相似度：同一部剧同一集的「正片」和「加更」资源名
         往往只差一个 `Plus`，任何按重合度的判定都会把正片算进来。
@@ -1044,7 +1044,14 @@ class VarietyPilot(_PluginBase):
             return True
         if task.subtype_word and task.subtype_word.lower() in (original or '').lower():
             return True
-        return _normalize_title(original) == _normalize_title(task.title)
+        # 站点种子名和下载下来的文件名经常不是同一个写法：
+        # 种子写 `Melody Journey S03E00 ...`，文件是 `音乐缘计划.Melody.Journey.S03E00 ...`，
+        # 站点把中文名省了、分隔符也从空格换成了点。
+        # 所以不能要求两边严格相等，改成「种子名完整出现在文件名里」。
+        # 仍然不做相似度计算——差一个字就算没命中，漏改总比误改好。
+        filename = _normalize_title(original)
+        name = _normalize_title(task.title)
+        return bool(name) and name in filename
 
     def _refresh_library(self, show_name: str) -> None:
         """通知媒体服务器刷新该剧，让 S00 新集尽快出现。"""

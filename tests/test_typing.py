@@ -258,6 +258,109 @@ def test_rename_rejects_wrong_type() -> None:
         )
 
 
+def test_rename_without_type_marker() -> None:
+    """文件名里没有衍生标记时，靠「种子名包含在文件名里」回连。
+
+    真实现场（2026-11-09）：音乐缘计划第三季先导片，站点种子名是
+    `Melody Journey S03E00 2026 1080p iQIYI WEB-DL H264 AAC-ADWeb`，
+    下载下来的文件却叫 `音乐缘计划.Melody.Journey.S03E00...mkv`——
+    站点把中文名省了、空格换成了点。原来要求两边严格相等，
+    于是回连不上，文件按原样落到 Season 3 / S03E00「第 0 集」。
+    """
+    seed = 'Melody Journey S03E00 2026 1080p iQIYI WEB-DL H264 AAC-ADWeb'
+    filename = '音乐缘计划.Melody.Journey.S03E00.2026.1080p.iQIYI.WEB-DL.H264.AAC-ADWeb.mkv'
+    with tempfile.TemporaryDirectory() as tmp:
+        store = TaskStore(Path(tmp) / 'tasks.json')
+        store.upsert(
+            Task(
+                tmdb_id=999001,
+                show_name='音乐缘计划',
+                sxx_episode=84,
+                sxx_name='第3季 先导片：薛之谦周深刘宇宁黄子弘凡互怼',
+                title=seed,
+                src_season=3,
+                src_episode=0,
+                src_site_season=3,
+                src_site_episode=0,
+                subtype='prequel',
+                subtype_word='先导片',
+                content_key='sig|3|||prequel||',
+                status=STATUS_SUBMITTED,
+            )
+        )
+
+        plugin = VarietyPilot()
+        plugin._config = {'enabled': True}
+        plugin._enabled = True
+        plugin._store = store
+
+        rename_dict = {
+            'season': 3,
+            'season_fmt': 'S03',
+            'episode': 0,
+            'season_episode': 'S03E00',
+            'episode_title': '第 0 集',
+            'name': '音乐缘计划',
+            'original_name': filename,
+        }
+        plugin.on_transfer_rename_build(
+            SimpleNamespace(event_data=SimpleNamespace(rename_dict=rename_dict))
+        )
+        assert rename_dict['season_episode'] == 'S00E84', (
+            f'先导片应落到 S00E84，实际 {rename_dict["season_episode"]}'
+        )
+        assert rename_dict['season'] == 0 and rename_dict['episode'] == 84, rename_dict
+
+
+def test_rename_keeps_main_episode() -> None:
+    """同剧正片不能被先导片任务改走。
+
+    种子里省了中文名，正片文件是 `音乐缘计划.Melody.Journey.S03E01...`，
+    与先导片的 S03E00 只差一个数字，宽松匹配很容易连坐。
+    """
+    seed = 'Melody Journey S03E00 2026 1080p iQIYI WEB-DL H264 AAC-ADWeb'
+    with tempfile.TemporaryDirectory() as tmp:
+        store = TaskStore(Path(tmp) / 'tasks.json')
+        store.upsert(
+            Task(
+                tmdb_id=999001,
+                show_name='音乐缘计划',
+                sxx_episode=84,
+                sxx_name='第3季 先导片',
+                title=seed,
+                src_season=3,
+                src_episode=0,
+                src_site_season=3,
+                src_site_episode=0,
+                subtype='prequel',
+                subtype_word='先导片',
+                content_key='sig|3|||prequel||',
+                status=STATUS_SUBMITTED,
+            )
+        )
+
+        plugin = VarietyPilot()
+        plugin._config = {'enabled': True}
+        plugin._enabled = True
+        plugin._store = store
+
+        rename_dict = {
+            'season': 3,
+            'season_fmt': 'S03',
+            'episode': 1,
+            'season_episode': 'S03E01',
+            'episode_title': '第 1 集',
+            'name': '音乐缘计划',
+            'original_name': '音乐缘计划.Melody.Journey.S03E01.2026.1080p.iQIYI.WEB-DL.H264.AAC-ADWeb.mkv',
+        }
+        plugin.on_transfer_rename_build(
+            SimpleNamespace(event_data=SimpleNamespace(rename_dict=rename_dict))
+        )
+        assert rename_dict['season_episode'] == 'S03E01', (
+            f'正片不该被改写，实际 {rename_dict["season_episode"]}'
+        )
+
+
 if __name__ == '__main__':
     check('加更不落直拍集', test_plus_not_into_clip)
     check('直拍不落加更集', test_clip_not_into_plus)
@@ -265,4 +368,6 @@ if __name__ == '__main__':
     check('未登记类型进入等待', test_unknown_type_waits_instead_of_stealing)
     check('整理按指纹回连任务', test_rename_matches_by_signature)
     check('整理时类型不符不改写', test_rename_rejects_wrong_type)
+    check('无类型标记靠种子名回连', test_rename_without_type_marker)
+    check('同剧正片不被连坐', test_rename_keeps_main_episode)
     print('全部通过：落位类型约束')
