@@ -265,11 +265,21 @@ class TaskStore:
         season: Optional[int],
         episode: Optional[int],
         statuses: Optional[Iterable[str]] = None,
+        subtype: Optional[str] = None,
+        only_unkeyed: bool = True,
     ) -> Optional[Task]:
-        """按站点发布序号反查任务。
+        """按站点发布序号反查任务，只用来兜底没有内容指纹的老记录。
 
-        升级前的任务记录没有内容指纹，只能靠站点序号判定「这份内容下过了」。
-        同一份内容的 1080p/2160p 共用同一个序号，不同片段各有各的序号，用它判重不会误伤。
+        站点 SxxExx 是文件发布序号，不是期号，而且**在不同衍生类型之间复用**：
+        同一部剧的 S04E01 可能既挂过先导片，又挂过加更、花絮、彩蛋。
+        所以这条兜底必须同时满足三件事，少一件就会把没下过的内容判成已下载：
+
+        1. 站点季号、序号都对得上；
+        2. 衍生类型一致（站点序号复用最典型的场景就是类型不同，如纯享↔加更）；
+        3. 那条记录本身没有指纹（`only_unkeyed`）。2.1.4 之后的记录都有指纹，
+           指纹对不上就是不同内容，再来比序号只会误判。
+
+        旧记录没存类型（更早版本）时不做类型限制，宁可退化成弱判断也不能漏判。
         """
         if episode is None:
             return None
@@ -277,6 +287,10 @@ class TaskStore:
         with self._lock:
             for task in self._tasks.values():
                 if task.tmdb_id != tmdb_id or task.src_site_episode != episode:
+                    continue
+                if only_unkeyed and task.content_key:
+                    continue
+                if subtype and task.subtype and task.subtype != subtype:
                     continue
                 if season is not None and task.src_site_season is not None:
                     if task.src_site_season != season:
@@ -349,6 +363,26 @@ class TaskStore:
             self._misses.clear()
             self._flush_locked()
             return count
+
+    def forget_misses(self, tmdb_id: int, titles: Iterable[str]) -> int:
+        """把已经成功落位的资源从「等待 TMDB 补齐」里移除。
+
+        等待列表只增不减的话，早先因为类型叫法不同（站点 Special、
+        TMDB 花絮特辑）没认出来的那批会一直挂在那儿，看着像 TMDB 缺数据。
+        """
+        doomed = {title for title in titles if title}
+        if not doomed:
+            return 0
+        with self._lock:
+            keys = [
+                key for key, miss in self._misses.items()
+                if miss.tmdb_id == tmdb_id and miss.title in doomed
+            ]
+            for key in keys:
+                self._misses.pop(key, None)
+            if keys:
+                self._flush_locked()
+            return len(keys)
 
     def clear(self, statuses: Optional[Iterable[str]] = None) -> int:
         with self._lock:

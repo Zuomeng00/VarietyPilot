@@ -136,7 +136,12 @@ def test_same_site_number_two_types() -> None:
 
 
 def test_unknown_type_waits_instead_of_stealing() -> None:
-    """TMDB 没登记的类型（第 3 季没彩蛋）不占加更的集，宁可等待。"""
+    """TMDB 没登记的类型（第 3 季没彩蛋）不占加更的集，宁可等待。
+
+    2.1.9 起原因文案从「TMDB 暂无对应集」改成「没有类型相符的特别集」：
+    TMDB 这一季是有衍生集的，只是没有彩蛋这一类，原来的说法会让人以为
+    TMDB 漏登记了这一集，白等。
+    """
     ctx = FakeContext('现在就出发 彩蛋.Natural.High.S03E30.2025.1080p.WEB-DL')
     with tempfile.TemporaryDirectory() as tmp:
         store = TaskStore(Path(tmp) / 'tasks.json')
@@ -144,7 +149,7 @@ def test_unknown_type_waits_instead_of_stealing() -> None:
         report = _run([ctx], submitted, store)
         assert submitted == [], f'彩蛋不该占加更集：{submitted}'
         reasons = [r['reason'] for r in report.records]
-        assert any('等待' in line for line in reasons), reasons
+        assert any('类型相符' in line or '等待' in line for line in reasons), reasons
 
 
 def test_rename_matches_by_signature() -> None:

@@ -164,7 +164,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.8'
+    plugin_version = '2.1.9'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'

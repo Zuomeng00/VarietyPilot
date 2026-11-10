@@ -54,11 +54,26 @@ SUBTYPE_NEIGHBORS: dict[str, set[str]] = {
 }
 
 
+# 落位时可以互换的类型对。只有「确实是同一类内容的不同叫法」才写进来。
+#
+# 站点把花絮特辑简写成 Special（`Natural High S04E04 Special`），
+# TMDB 那边叫「第4季 第4期花絮特辑」，识别出来分别是 special 与 uncut。
+# 不认成同一类的话，这批资源永远进不了它对应的那一集，只能挂在
+# 「等待 TMDB 补齐」里——而 TMDB 明明有。
+#
+# 加更、纯享、彩蛋之间不在此列：它们各有各的集，串了就是刮削错。
+SUBTYPE_LANDABLE: dict[str, set[str]] = {
+    'special': {'uncut'},
+    'uncut': {'special'},
+}
+
+
 def subtypes_compatible(left: Optional[str], right: Optional[str]) -> bool:
     """两种衍生类型能不能落到同一集。
 
     加更落到「黄景瑜直拍」那一集上，文件名和内容就是两回事，刮削全错。
-    所以只认同一种类型：加更只能进加更集、彩蛋只能进彩蛋集。
+    所以只认同一种类型，外加 SUBTYPE_LANDABLE 里那几对纯叫法差异。
+
     邻接类型（加更≈彩蛋≈纯享）只用来打分，不作为落位依据——
     第 3 季没登记彩蛋时，彩蛋资源该去等待队列，不能去占加更的位置。
 
@@ -66,7 +81,9 @@ def subtypes_compatible(left: Optional[str], right: Optional[str]) -> bool:
     """
     if not left or not right:
         return True
-    return left == right
+    if left == right:
+        return True
+    return right in SUBTYPE_LANDABLE.get(left, set())
 
 
 @dataclass(slots=True)
@@ -572,12 +589,31 @@ def rank_specials(
         if not episodes:
             return []
     if target.subtype:
-        # 类型不符的集直接排除：加更不能落到直拍集上
-        episodes = [
-            item for item in episodes if subtypes_compatible(target.subtype, item.subtype)
-        ]
-        if not episodes:
-            return []
+        # 类型不符的集排除掉：加更不能落到直拍集上
+        typed = [item for item in episodes if subtypes_compatible(target.subtype, item.subtype)]
+        if typed:
+            episodes = typed
+        else:
+            # 一条都对不上：挑出「期号对得上、只是类型叫法不同」的集交给落位环节，
+            # 由它明确报「没有类型相符的特别集」。
+            # 直接返回空，上层会当成「TMDB 没登记这一集」挂进等待队列反复重试，
+            # 而 TMDB 里其实有，只是叫法不同（站点 Special ↔ TMDB 花絮特辑这种）。
+            period = target.episode
+            near = [item for item in episodes if period is not None and item.period == period]
+            if not near:
+                # 期号也对不上时，仍要留几条候选：这一季确实有衍生集，
+                # 只是没有这一类，报「类型不符」比报「TMDB 没登记」准确。
+                near = episodes[:3]
+            return [
+                MatchResult(
+                    episode=item.episode,
+                    name=item.name,
+                    score=0.0,
+                    reasons=['类型不符'],
+                    subtype=item.subtype,
+                )
+                for item in near[:3]
+            ]
     scored = [score_episode(target, episode, index, target_date=air_date) for episode in episodes]
     scored = [item for item in scored if item.score > -50]
     if not scored:

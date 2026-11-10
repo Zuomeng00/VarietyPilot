@@ -152,14 +152,17 @@ class ScanReport:
 
     def add_record(self, candidate: Candidate, status: str, reason: str = '') -> None:
         """记录单条资源的去向，供插件页面逐条查看。"""
+        # 类型不符的候选只是「拿来证明这一期有集、但类型不同」，
+        # 它并没有真的落位，目标写成集号会让人以为下到了错集上
+        landed = not reason.startswith('没有类型相符')
         self.records.append(
             {
                 'show': self.show,
                 'title': candidate.title,
                 'site': candidate.site,
                 'src': _source_label(candidate.parsed),
-                'target': f'S00E{candidate.match.episode:02d}',
-                'sxx_name': candidate.match.name,
+                'target': f'S00E{candidate.match.episode:02d}' if landed else '-',
+                'sxx_name': candidate.match.name if landed else '',
                 'score': round(candidate.match.score, 1),
                 'size_gb': round(candidate.size_gb, 2),
                 'seeders': candidate.seeders,
@@ -365,6 +368,10 @@ def build_candidates(
         # 先解析一次，再一次性拿到该资源可落位的全部候选集号，
         # 落位环节需要在候选之间做取舍，只取最高分一条会导致多条资源撞同一集。
         parsed = parse_release(strip_show_name(title, names), strip_show_name(description, names))
+        if parsed.is_pack:
+            # 整季包不进衍生链路：包里的正片该由订阅处理，衍生内容也分不出来，
+            # 收进来只会白占一个集号，还会一直挂在「等待 TMDB 补齐」里
+            continue
         is_derived = parsed.subtype is not None
         # 用户关掉的类型（例如直拍）连解析后的落位都不做，直接排除。
         # 放在季号判断之前：类型比季更硬，先判类型能少一次无用匹配。
@@ -775,6 +782,11 @@ def scan_show(
         type_filtered=type_filtered,
     )
 
+    # 这批资源已经在 TMDB 里找到了对应集，之前挂在「等待补齐」里的记录要撤掉，
+    # 否则修好匹配后旧记录还挂着，看着像 TMDB 一直缺数据
+    if candidates:
+        store.forget_misses(show.tmdb_id, [item.title for item in candidates])
+
     # 先按体积/做种筛掉不合规的资源，再做落位分配。
     # 顺序不能反：被筛掉的资源如果先占了集号，会让合规资源被迫挤到下一集。
     eligible: list[Candidate] = []
@@ -798,11 +810,18 @@ def scan_show(
             if existing is not None:
                 break
         if existing is None:
-            # 升级前的任务记录没有指纹，退回按站点序号判断
+            # 兜底：只有升级前没有指纹的老记录才靠站点序号认，
+            # 且必须类型一致。站点同一序号会被先导片、加更、花絮轮流复用，
+            # 光比序号会把没下过的内容判成已下载（加更撞上纯享那条记录）。
             parsed = candidate.parsed
             season = parsed.site_season if parsed.site_season is not None else parsed.season
             existing = store.find_by_ordinal(
-                show.tmdb_id, season, _ordinal(candidate), statuses=done_status
+                show.tmdb_id,
+                season,
+                _ordinal(candidate),
+                statuses=done_status,
+                subtype=parsed.subtype,
+                only_unkeyed=True,
             )
         if existing and not options.overwrite_existing:
             pre_skipped.append(
