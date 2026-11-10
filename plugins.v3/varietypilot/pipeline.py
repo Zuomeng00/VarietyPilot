@@ -615,6 +615,7 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
         pool.sort(key=lambda option: (option.score, -option.episode), reverse=True)
 
         pick: Optional[MatchResult] = None
+        blocked_untyped = False
         seen: set[int] = set()
         for option in pool:
             if option.episode in seen:
@@ -623,17 +624,27 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
             # 类型对不上的集不占：加更占掉直拍那一集，刮削就全乱了
             if not subtypes_compatible(want, option.subtype):
                 continue
+            # 类型没识别出来时不能「分高就落」：词表追不上站点的叫法，
+            # 遇到没见过的写法（未删减版、案情回顾、坞民日记……）就当成
+            # 无类型放行，等于把这条资源丢给期号去猜，猜错就是刮错，
+            # 而且错了要人工进媒体库收拾。所以只认硬证据：播出日期、
+            # 片段名，或「期号对上且这一期只有一条集」。都不满足就进等待队列，
+            # 等站点把副标题写全，或者等词表补上这个词。
+            if want is None and option.subtype is not None and not option.allows_untyped_landing():
+                blocked_untyped = True
+                continue
             if option.episode in used:
                 continue
             pick = option
             break
 
         if pick is None:
-            reason = (
-                '没有类型相符的特别集可落位，本轮先不处理'
-                if any(not subtypes_compatible(want, option.subtype) for option in pool)
-                else '可用的特别集号都已被本轮其他资源占用，本轮先不处理'
-            )
+            if blocked_untyped:
+                reason = '这条资源的衍生类型没能识别，为避免刮错先不落位'
+            elif any(not subtypes_compatible(want, option.subtype) for option in pool):
+                reason = '没有类型相符的特别集可落位，本轮先不处理'
+            else:
+                reason = '可用的特别集号都已被本轮其他资源占用，本轮先不处理'
             for item in items:
                 skipped.append((item, reason))
             continue

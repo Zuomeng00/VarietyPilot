@@ -279,10 +279,14 @@ class TaskStore:
         3. 那条记录本身没有指纹（`only_unkeyed`）。2.1.4 之后的记录都有指纹，
            指纹对不上就是不同内容，再来比序号只会误判。
 
-        旧记录没存类型（更早版本）时不做类型限制，宁可退化成弱判断也不能漏判。
+        旧记录没存类型（更早版本）时，从它当时落位的那条 TMDB 集名反推类型：
+        `第4季 第2期下纯享·瞎掰故事王` 反推出 pure，和新资源（加更）不是一回事，
+        就不能拿序号挡。反推不出来才退化成弱判断，宁可漏判也不误杀。
         """
         if episode is None:
             return None
+        from .titles import detect_subtype
+
         wanted = set(statuses) if statuses else None
         with self._lock:
             for task in self._tasks.values():
@@ -290,8 +294,14 @@ class TaskStore:
                     continue
                 if only_unkeyed and task.content_key:
                     continue
-                if subtype and task.subtype and task.subtype != subtype:
-                    continue
+                if subtype:
+                    if task.subtype:
+                        if task.subtype != subtype:
+                            continue
+                    else:
+                        inferred = detect_subtype(task.sxx_name or '')[0]
+                        if inferred and inferred != subtype:
+                            continue
                 if season is not None and task.src_site_season is not None:
                     if task.src_site_season != season:
                         continue

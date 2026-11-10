@@ -126,6 +126,36 @@ class MatchResult:
     air_date: Optional[str] = None
     # 这一集在 TMDB 集名里标明的衍生类型，落位时用它挡住类型不符的集
     subtype: Optional[str] = None
+    # 命中的强证据：period（真实期号）/ date（播出日期）/ segment（片段名）。
+    # 分数高不等于证据硬——站点序号、季号、年份都能对上但内容并不相同的
+    # 情况很多，所以「资源自己没标类型」时只认这几项。
+    evidence: frozenset[str] = frozenset()
+    # 同一期里带类型的集有几条。只有一条时「期号对上」就等于「位置唯一」，
+    # 多条时（第5期同时有加更、花絮、纯享）光凭期号分不出是哪一条。
+    period_peers: int = 0
+
+    @property
+    def strong(self) -> bool:
+        """是否有能独立证明「就是这一集」的证据（不含站点序号）。"""
+        return bool(self.evidence)
+
+    def allows_untyped_landing(self) -> bool:
+        """资源自身没标衍生类型时，这一集能不能凭证据落位。
+
+        类型词表永远追不上站点的叫法，没见过的写法解析出 subtype=None。
+        这时如果直接按分数落位，等于让期号去猜——猜中纯属运气，猜错就是
+        把直拍塞进加更那一集，还得人工进媒体库收拾。
+
+        注意播出日期在这里帮不上忙：同一期的加更、花絮、直拍是同一天发的，
+        日期对得上只能证明「是这一期」，证明不了「是这一期的哪一条」。
+        能定死位置的只有两样：
+
+        1. 片段名对得上（同一期拆出来的多个片段，名字是唯一的）；
+        2. 期号对得上，且这一期在 TMDB 里只有一条带类型的集——位置唯一。
+        """
+        if 'segment' in self.evidence:
+            return True
+        return 'period' in self.evidence and self.period_peers <= 1
 
     def describe(self) -> str:
         return f'S00E{self.episode:02d} 《{self.name}》 得分 {self.score:.1f}（{"; ".join(self.reasons)}）'
@@ -442,6 +472,7 @@ def score_episode(
     """对单条候选打分。打分维度全部来自标题字段，可回溯。"""
     score = 0.0
     reasons: list[str] = []
+    evidence: set[str] = set()
 
     # 季维度
     if target.season is not None and candidate.season is not None:
@@ -476,6 +507,7 @@ def score_episode(
     if target.episode is not None and candidate.period is not None and not target.episode_is_site_ordinal:
         if target.episode == candidate.period:
             score += SCORE_EPISODE_HIT
+            evidence.add('period')
             reasons.append(f'期号一致 第{target.episode}期')
         else:
             return MatchResult(
@@ -484,6 +516,7 @@ def score_episode(
                 score=-99.0,
                 reasons=['期号不符'],
                 subtype=candidate.subtype,
+                evidence=frozenset(),
             )
     elif target.episode_is_site_ordinal and candidate.period is not None:
         reasons.append(f'站点序号 E{target.episode}（不作期号）')
@@ -529,6 +562,7 @@ def score_episode(
                 score=-99.0,
                 reasons=[f'分P不符（{target.part}≠{candidate.part}）'],
                 subtype=candidate.subtype,
+                evidence=frozenset(),
             )
     elif target.part and not candidate.part:
         score -= SCORE_PART_HIT
@@ -539,6 +573,8 @@ def score_episode(
         delta, note = _segment_score(target.segment, candidate.segment)
         if delta or note:
             score += delta
+            if delta >= SCORE_SEGMENT_HIT:
+                evidence.add('segment')
             reasons.append(note)
 
     # 日期兜底：越接近分数越高
@@ -546,13 +582,19 @@ def score_episode(
     if gap is not None:
         if gap == 0:
             score += SCORE_DATE_EXACT
+            evidence.add('date')
             reasons.append('日期一致')
         elif gap <= 2:
             score += SCORE_DATE_NEAR
+            evidence.add('date')
             reasons.append(f'日期接近（差{gap}天）')
         elif gap <= 4:
             score += SCORE_DATE_FAR
             reasons.append(f'日期较远（差{gap}天）')
+
+    peers = 0
+    if candidate.period is not None:
+        peers = sum(1 for item in index.episodes if item.period == candidate.period and item.subtype)
 
     return MatchResult(
         episode=candidate.episode,
@@ -561,6 +603,8 @@ def score_episode(
         reasons=reasons,
         air_date=candidate.air_date,
         subtype=candidate.subtype,
+        evidence=frozenset(evidence),
+        period_peers=peers,
     )
 
 
@@ -617,7 +661,12 @@ def rank_specials(
     scored = [score_episode(target, episode, index, target_date=air_date) for episode in episodes]
     scored = [item for item in scored if item.score > -50]
     if not scored:
-        return []
+        # 期号一个都对不上时，退回按日期认一次。
+        # 站点期号常把正片和衍生放在一套编号里数，TMDB 只给衍生单独编号，
+        # 两边差一到两位是常态；光比期号会让 TMDB 明明有的资源一直挂在等待里。
+        # 收紧到「同类型 + 播出日期完全一致」才算：同一天、同一类型、
+        # 同一季出现两条衍生内容的情况基本不存在，不会误落。
+        return _rank_by_date(target, episodes, index, air_date, limit)
     scored.sort(key=lambda item: (item.score, -item.episode), reverse=True)
 
     best_score = scored[0].score
@@ -629,6 +678,42 @@ def rank_specials(
     # 保留与最佳结果相差不超过 3 分的候选：同一期的多个片段通常就落在这一档里
     keep = [item for item in scored if item.score >= max(floor, best_score - 3.0)]
     return keep[:limit]
+
+
+def _rank_by_date(
+    target: ParsedTitle,
+    episodes: list[SpecialEpisode],
+    index: SpecialIndex,
+    air_date: Optional[date],
+    limit: int,
+) -> list[MatchResult]:
+    """期号全线不符时的兜底：同类型 + 播出日期完全一致。
+
+    只在前面的期号匹配一条都没留下时才走这条路，且必须有确切的播出日期。
+    日期缺失或只是相近，一律返回空——那种情况下没有任何一条信号能证明
+    「这就是同一集」，宁可进等待。
+    """
+    day = air_date or target.air_date
+    if day is None:
+        return []
+    matched: list[MatchResult] = []
+    for episode in episodes:
+        if episode.air_date:
+            air = _parse_date(episode.air_date)
+            if air != day:
+                continue
+        elif episode.period is not None:
+            # 集名带了期号、却没有播出日期，说明索引里日期不全，不能拿来对齐
+            continue
+        if not subtypes_compatible(target.subtype, episode.subtype):
+            continue
+        result = score_episode(target, episode, index, target_date=day)
+        result.score = 0.0
+        result.reasons = [*result.reasons, '期号不符，按播出日期对齐']
+        result.evidence = frozenset({'date'} | set(result.evidence))
+        matched.append(result)
+    matched.sort(key=lambda item: item.episode)
+    return matched[:limit]
 
 
 def match_special(
