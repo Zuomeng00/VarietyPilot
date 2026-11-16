@@ -159,12 +159,31 @@ def _normalize_title(name: str) -> str:
     return re.sub(r'[^a-z0-9\u4e00-\u9fff]+', '', text.lower())
 
 
+# 清晰度、编码、音轨这类词：同一条种子换个分辨率重新发布，标题只差这几个词。
+# 整理时拿到的文件可能是 1080p 而任务记录的是 2160p，把它们去掉才能认出来。
+_RELEASE_TECH = re.compile(
+    r'(?:2160p|1080p|1080i|720p|480p|4k|8k|uhd|hdr10\+?|hdr|dolby|dv|'
+    r'web-?dl|webrip|blu-?ray|bluray|remux|hdtv|'
+    r'x?26[45]|hevc|avc|av1|10bit|8bit|60fps|50fps|25fps|'
+    r'ddp\s*\d(?:[.\s]\d)?|dd\s*\d(?:[.\s]\d)?|ac3|eac3|dts(?:-hd)?|flac|aac|atmos|truehd)',
+    re.IGNORECASE,
+)
+
+
+def _release_key(name: str) -> str:
+    """去掉分辨率与压制参数后的资源名，用于判断「同一条种子」。
+
+    不做任何相似度计算：去完技术词还得逐字相同才算同一条。
+    """
+    return _normalize_title(_RELEASE_TECH.sub(' ', name or ''))
+
+
 class VarietyPilot(_PluginBase):
     # ---- 插件元信息
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.10'
+    plugin_version = '2.1.11'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -670,8 +689,8 @@ class VarietyPilot(_PluginBase):
                 )
                 submitted += report.submitted
                 collected.extend(report.records)
+                # 页面上的完整明细：每部剧一行统计，加上逐条去向
                 lines.append(report.line())
-                # 明细已按「失败 → 已提交 → 跳过」排好，失败原因排在最前
                 for detail in report.details[:20]:
                     lines.append(f'  · {detail}')
             if len(collected) > 20:
@@ -679,16 +698,58 @@ class VarietyPilot(_PluginBase):
             self._last_scan_at = time.time()
             self._last_records = collected[-400:]
             self._last_report = '\n'.join(lines)
-            summary = '\n'.join(lines)
+            # 通知只说这轮下了什么，跳过的逐条原因留在插件页面看
+            summary = self._notice_text(collected, dry)
             if _to_bool(self._config.get('notify'), True) and (submitted or not dry):
                 title = '【综艺衍生内容】预演结果' if dry else '【综艺衍生内容】已提交下载'
-                self.post_message(title=title, text=summary[:3000])
+                self.post_message(title=title, text=summary[:1500])
             return submitted, summary
         finally:
             with self._lock:
                 self._scanning = False
 
     # --------------------------------------------------------------- 外部调用
+
+    @staticmethod
+    def _notice_text(records: List[Dict[str, Any]], dry: bool) -> str:
+        """通知正文：只说这轮下了什么。
+
+        跳过、等待的逐条原因全部留在插件页面「最近扫描明细」里。
+        手机上看几十行「该内容已下载过」没有任何用，真正要确认的只有
+        「有没有新内容下下来」，以及「有没有下失败」。
+        """
+        done_status = '预演' if dry else '已提交'
+        done = [item for item in records if item.get('status') == done_status]
+        failed = [item for item in records if item.get('status') == '失败']
+        waiting = sum(1 for item in records if item.get('status') == '等待')
+        skipped = sum(1 for item in records if item.get('status') == '跳过')
+
+        lines: List[str] = []
+        if done:
+            lines.append(f'{len(done)} 条：')
+            for item in done[:10]:
+                label = item.get('sxx_name') or str(item.get('title') or '')[:30]
+                head = f'{item.get("show", "")} {item.get("target") or ""}'.strip()
+                lines.append(f'· {head} {label}'.strip())
+            if len(done) > 10:
+                lines.append(f'· 另外 {len(done) - 10} 条，见插件页面')
+        else:
+            lines.append('本轮没有新内容。')
+
+        for item in failed[:3]:
+            title = str(item.get('title') or '')[:40]
+            lines.append(f'失败：{title}（{item.get("reason") or "未知原因"}）')
+
+        tail: List[str] = []
+        if skipped:
+            tail.append(f'跳过 {skipped}')
+        if waiting:
+            tail.append(f'等待 TMDB 补齐 {waiting}')
+        if failed:
+            tail.append(f'失败 {len(failed)}')
+        if tail:
+            lines.append('、'.join(tail) + '，逐条原因见插件页面「最近扫描明细」')
+        return '\n'.join(lines)
 
     def _search(self, name: str, sites: List[int]) -> List[Any]:
         from app.chain.search import SearchChain
@@ -998,7 +1059,7 @@ class VarietyPilot(_PluginBase):
             task
             for task in self._store.all()
             if task.status in (STATUS_SUBMITTED, STATUS_QUEUED)
-            and not (title and task.show_name not in title and title not in task.show_name)
+            and self._same_show(task, title, original)
             and self._is_derived_file(parsed, original, task)
         ]
 
@@ -1028,12 +1089,35 @@ class VarietyPilot(_PluginBase):
         return None
 
     @staticmethod
+    def _same_show(task: Task, title: str, original: str) -> bool:
+        """整理上下文里的剧名能不能对上这条任务。
+
+        rename_dict 里的 name 来自 TMDB，可能是**英文原名**
+        （音乐缘计划 → Melody Journey），而任务里存的是中文名。
+        直接按「中文名必须出现在剧名里」过滤，整部剧的文件都会认不出，
+        下载成功了却不整理，看起来像插件没工作。
+
+        所以按三条任一成立就算同一部剧：剧名互相包含、中文名出现在文件名里、
+        或种子标题（去清晰度后）出现在文件名里。
+        """
+        if not title:
+            return True
+        show = task.show_name or ''
+        if show and (show in title or title in show):
+            return True
+        if show and show in (original or ''):
+            return True
+        name = _release_key(task.title)
+        return bool(name) and name in _release_key(original)
+
+    @staticmethod
     def _is_derived_file(parsed: Any, original: str, task: Task) -> bool:
         """判断待整理文件确实是衍生内容，而不是同剧正片。
 
-        判据只有两条，都很硬：
+        判据三条，逐条收紧：
         1. 文件名能解析出衍生类型（加更/彩蛋/Plus/Special 等）；
-        2. 文件名与任务记录的种子名对得上。
+        2. 文件名里带这条任务的类型词（站点英文写法）；
+        3. 文件名与任务记录的种子名对得上（忽略清晰度差异）。
 
         为什么不用模糊相似度：同一部剧同一集的「正片」和「加更」资源名
         往往只差一个 `Plus`，任何按重合度的判定都会把正片算进来。
@@ -1048,9 +1132,10 @@ class VarietyPilot(_PluginBase):
         # 种子写 `Melody Journey S03E00 ...`，文件是 `音乐缘计划.Melody.Journey.S03E00 ...`，
         # 站点把中文名省了、分隔符也从空格换成了点。
         # 所以不能要求两边严格相等，改成「种子名完整出现在文件名里」。
+        # 也不能要求清晰度一致——任务记的是 2160p、实际下到的可能是 1080p。
         # 仍然不做相似度计算——差一个字就算没命中，漏改总比误改好。
-        filename = _normalize_title(original)
-        name = _normalize_title(task.title)
+        filename = _release_key(original)
+        name = _release_key(task.title)
         return bool(name) and name in filename
 
     def _refresh_library(self, show_name: str) -> None:
