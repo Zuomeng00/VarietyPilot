@@ -170,12 +170,41 @@ _RELEASE_TECH = re.compile(
 )
 
 
-def _release_key(name: str) -> str:
-    """去掉分辨率与压制参数后的资源名，用于判断「同一条种子」。
+# 压制组名。同一条种子在不同站点、不同文件名里的位置完全不一样：
+# 种子名常写成 `... H265 DDP2.0-ADWeb`（尾缀），下载下来的文件却是
+# `[ADWeb].Go.Fighting.S10E03...`（前缀）。整串比对时这两串永远对不上，
+# 于是整部剧的文件都认不回任务，下载成功却不整理。
+# 组名本身对「是不是同一条内容」没有信息量，两头都剥掉再比。
+_LEAD_TAG = re.compile(r'^\s*(?:[\[【(][^\]】)]{1,24}[\]】)]\s*[.\-_\s]*)+')
+_TAIL_TAG = re.compile(r'[-_]\s*[A-Za-z][A-Za-z0-9]{1,15}\s*$')
 
-    不做任何相似度计算：去完技术词还得逐字相同才算同一条。
+# 剧名段与集号的分界。剧名比对和集号回连都从这里切，避免把组名算进剧名。
+_EPISODE_MARK = re.compile(r'(?:S\d{1,4}[\s._-]?E\d{1,5}|E\d{1,5}|第\s*\d{1,4}\s*[期集话])', re.IGNORECASE)
+
+
+def _release_key(name: str) -> str:
+    """去掉组名、分辨率与压制参数后的资源名，用于判断「同一条种子」。
+
+    不做任何相似度计算：去完这些没有信息量的词还得逐字相同才算同一条。
     """
-    return _normalize_title(_RELEASE_TECH.sub(' ', name or ''))
+    text = _EXT_RE.sub('', name or '')
+    text = _LEAD_TAG.sub(' ', text)
+    text = _RELEASE_TECH.sub(' ', text)
+    text = _TAIL_TAG.sub(' ', text)
+    return _normalize_title(text)
+
+
+def _name_head(name: str) -> str:
+    """取剧名段：第一个集号标记之前的那截。
+
+    `[ADWeb].Go.Fighting.S10E03` → `adwebgofighting`，
+    组名混在里面也没关系，两边互相包含即可，不做切词。
+    """
+    text = _EXT_RE.sub('', (name or '').strip())
+    found = _EPISODE_MARK.search(text)
+    if found and found.start() > 0:
+        text = text[:found.start()]
+    return _normalize_title(text)
 
 
 class VarietyPilot(_PluginBase):
@@ -183,7 +212,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.11'
+    plugin_version = '2.1.12'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -872,7 +901,12 @@ class VarietyPilot(_PluginBase):
         rename_dict = getattr(data, 'rename_dict', None)
         if not isinstance(rename_dict, dict):
             return
-        task = self._match_task(rename_dict)
+        # 能拿到下载 hash 就直接按 hash 定位，这是唯一不会认错的方式：
+        # 站点把英文剧名换成中文、或者类型只写在副标题里时，标题怎么比都可能偏，
+        # 而 hash 与「这条任务」是一一对应的。
+        task = self._task_by_event_hash(data, rename_dict)
+        if task is None:
+            task = self._match_task(rename_dict)
         if not task:
             self._guard_unmatched(rename_dict)
             return
@@ -881,6 +915,34 @@ class VarietyPilot(_PluginBase):
             f'综艺衍生内容管家：{task.show_name} 整理改写为 S00E{task.sxx_episode:02d}'
             f'《{task.sxx_name}》（原 {task.title}）'
         )
+
+    def _task_by_event_hash(self, data: Any, rename_dict: Dict[str, Any]) -> Optional[Task]:
+        """用事件里的下载 hash 找任务。
+
+        MP 各版本、各事件把 hash 放在不同位置（data 上、fileitem 上、meta 上），
+        不同版本还可能是字典或对象，所以逐个位置试一遍；一个都取不到就返回 None，
+        交给标题匹配兜底，不影响原有逻辑。
+        """
+        candidates: list[str] = []
+        for name in ('download_hash', 'hash', 'download_id'):
+            value = _get_field(data, name)
+            if value:
+                candidates.append(str(value))
+        for holder in ('fileitem', 'file_item', 'file_meta', 'meta', 'torrent', 'torrent_info'):
+            node = _get_field(data, holder)
+            if node is None:
+                continue
+            for name in ('download_hash', 'hash', 'download_id'):
+                value = _get_field(node, name)
+                if value:
+                    candidates.append(str(value))
+        if not candidates:
+            return None
+        for value in candidates:
+            task = self._store.find_by_hash(value)
+            if task is not None and task.status in (STATUS_SUBMITTED, STATUS_QUEUED):
+                return task
+        return None
 
     @staticmethod
     def _task_display_title(task: Task) -> str:
@@ -1073,6 +1135,7 @@ class VarietyPilot(_PluginBase):
                 if task.content_key == exact:
                     return task
 
+        matched: list[Task] = []
         for task in tasks:
             # 类型对不上的不是同一条内容，宁可漏改也不改错
             if parsed is not None and not subtypes_compatible(parsed.subtype, task.subtype):
@@ -1081,12 +1144,27 @@ class VarietyPilot(_PluginBase):
                 continue
             # 优先用站点编号回连，其次退回真实期号
             if task.src_site_episode is not None:
-                if task.src_site_episode not in episodes:
-                    continue
-                return task
+                if task.src_site_episode in episodes:
+                    matched.append(task)
+                continue
             if task.src_episode is not None and task.src_episode in episodes:
-                return task
-        return None
+                matched.append(task)
+
+        if not matched:
+            return None
+        if len(matched) > 1 and (parsed is None or parsed.subtype is None):
+            # 同一个站点编号下挂着好几条不同类型的任务（加更、纯享、彩蛋共用
+            # S03E23 这种编号），而文件名里没写类型，挑哪条都是猜。
+            # 挑错的代价是把加更改到纯享那一集，还得人工进媒体库收拾，
+            # 所以这次不改，等下次扫描用副标题把类型补上。
+            logger.warning(
+                '综艺衍生内容管家：%s 命中 %d 条候选任务但文件未标明衍生类型，本次不改名：%s',
+                original,
+                len(matched),
+                '、'.join(f'{task.sxx_name}({task.subtype})' for task in matched),
+            )
+            return None
+        return matched[0]
 
     @staticmethod
     def _same_show(task: Task, title: str, original: str) -> bool:
@@ -1097,8 +1175,13 @@ class VarietyPilot(_PluginBase):
         直接按「中文名必须出现在剧名里」过滤，整部剧的文件都会认不出，
         下载成功了却不整理，看起来像插件没工作。
 
-        所以按三条任一成立就算同一部剧：剧名互相包含、中文名出现在文件名里、
-        或种子标题（去清晰度后）出现在文件名里。
+        所以按四条任一成立就算同一部剧：剧名互相包含、中文名出现在文件名里、
+        剧名段互相包含、或种子标题（去组名与清晰度后）出现在文件名里。
+
+        第四条是为组名错位准备的：种子写 `Go Fighting S10E03 ... -ADWeb`，
+        下载下来的文件是 `[ADWeb].Go.Fighting.S10E03 ...`，整串比对必然失败，
+        但把两个「第一个集号之前」的剧名段取出来，`gofighting` 与
+        `adwebgofighting` 是包含关系，一眼就能认出是同一部剧。
         """
         if not title:
             return True
@@ -1106,6 +1189,12 @@ class VarietyPilot(_PluginBase):
         if show and (show in title or title in show):
             return True
         if show and show in (original or ''):
+            return True
+        head_seed = _name_head(task.title)
+        head_file = _name_head(original)
+        if min(len(head_seed), len(head_file)) >= 3 and (
+            head_seed in head_file or head_file in head_seed
+        ):
             return True
         name = _release_key(task.title)
         return bool(name) and name in _release_key(original)
@@ -1117,12 +1206,18 @@ class VarietyPilot(_PluginBase):
         判据三条，逐条收紧：
         1. 文件名能解析出衍生类型（加更/彩蛋/Plus/Special 等）；
         2. 文件名里带这条任务的类型词（站点英文写法）；
-        3. 文件名与任务记录的种子名对得上（忽略清晰度差异）。
+        3. 文件名与任务记录的种子名对得上（忽略组名与清晰度差异）。
 
         为什么不用模糊相似度：同一部剧同一集的「正片」和「加更」资源名
         往往只差一个 `Plus`，任何按重合度的判定都会把正片算进来。
         宁可漏改（文件落进正片季，肉眼可见、可手工处理），
         也不能误改（正片被塞进 Season 00，等于毁库）。
+
+        曾经试过再加一条「剧名段 + 季集号对上就放行」，用来兜住「类型只写在
+        副标题里、文件名又把英文剧名换成了中文」的情况，但这条和正片没法区分：
+        正片整理时同样剧名对得上、季集号也对得上，等于给毁库开了口子。
+        那种情况的正确解法是拿下载 hash 精确定位（见 on_transfer_rename_build），
+        而不是在文件名上继续加宽判据。
         """
         if parsed is not None and parsed.subtype is not None:
             return True
@@ -1130,7 +1225,7 @@ class VarietyPilot(_PluginBase):
             return True
         # 站点种子名和下载下来的文件名经常不是同一个写法：
         # 种子写 `Melody Journey S03E00 ...`，文件是 `音乐缘计划.Melody.Journey.S03E00 ...`，
-        # 站点把中文名省了、分隔符也从空格换成了点。
+        # 站点把中文名省了、分隔符也从空格换成了点，压制组名还从尾缀挪到了前缀。
         # 所以不能要求两边严格相等，改成「种子名完整出现在文件名里」。
         # 也不能要求清晰度一致——任务记的是 2160p、实际下到的可能是 1080p。
         # 仍然不做相似度计算——差一个字就算没命中，漏改总比误改好。

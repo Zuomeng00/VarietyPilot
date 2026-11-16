@@ -50,10 +50,12 @@ def apply_to_rename_dict(rename_dict: dict, target_episode: int, target_title: s
     return rename_dict
 
 
-_RE_SEASON_EPISODE = re.compile(r'(?<![A-Za-z0-9])S(\d{1,2})\s*E(\d{1,4})(?!\d)', re.IGNORECASE)
-_RE_SEASON_DIR = re.compile(r'(Season\s*)(\d{1,2})(?!\d)', re.IGNORECASE)
+# 季号 1~4 位：国内综艺常用播出年份当季号（你好星期六 S2026E08），
+# 只认 1~2 位时这类路径的季集写法改不动，文件会落进正片季。
+_RE_SEASON_EPISODE = re.compile(r'(?<![A-Za-z0-9])S(\d{1,4})\s*E(\d{1,4})(?!\d)', re.IGNORECASE)
+_RE_SEASON_DIR = re.compile(r'(Season\s*)(\d{1,4})(?!\d)', re.IGNORECASE)
 _RE_SEASON_CN_DIR = re.compile(r'(第\s*)(\d{1,2})(\s*季)')
-_RE_SEASON_FMT = re.compile(r'(?<![A-Za-z0-9])S(\d{1,2})(?![A-Za-z0-9])')
+_RE_SEASON_FMT = re.compile(r'(?<![A-Za-z0-9])S(\d{1,4})(?![A-Za-z0-9])')
 
 
 def rewrite_render_str(render_str: str, target_episode: int) -> str:

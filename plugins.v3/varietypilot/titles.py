@@ -170,13 +170,16 @@ _CN_NUM = r'[零〇一二两三四五六七八九十百]+'
 
 # 季号
 _RE_SEASON_CN = re.compile(rf'第\s*({_CN_NUM}|\d{{1,2}})\s*[季部]')
-_RE_SEASON_S = re.compile(r'(?<![A-Za-z0-9])S(\d{1,2})(?![\dEe])')
+# 季号允许 1~4 位：国内综艺大量用播出年份当季号（你好星期六 S2026E08、
+# 歌手 S2026E05、天赐的声音 S2026E03），只认 1~2 位会把这些剧的季集号
+# 整体解析失败，进而认不出这是衍生内容、也回连不上任务。
+_RE_SEASON_S = re.compile(r'(?<![A-Za-z0-9])S(\d{1,4})(?![\dEe])')
 _RE_YEAR = re.compile(r'(?<!\d)(20\d{2})(?!\d)')
 
 # 期号
 _RE_EPISODE_CN = re.compile(rf'第\s*({_CN_NUM}|\d{{1,3}})\s*[期集话回]')
 _RE_EPISODE_EP = re.compile(r'(?<![A-Za-z])EP?\s*(\d{1,4})(?!\d)', re.IGNORECASE)
-_RE_SEASON_EPISODE = re.compile(r'(?<![A-Za-z0-9])S(\d{1,2})\s*[.\-_ ]?\s*E(\d{1,4})(?!\d)', re.IGNORECASE)
+_RE_SEASON_EPISODE = re.compile(r'(?<![A-Za-z0-9])S(\d{1,4})\s*[.\-_ ]?\s*E(\d{1,4})(?!\d)', re.IGNORECASE)
 
 # 日期
 _RE_DATE_FULL = re.compile(r'(?<!\d)(20\d{2})[.\-_/年]?(\d{1,2})[.\-_/月]?(\d{1,2})(?!\d)')

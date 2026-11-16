@@ -474,22 +474,30 @@ def score_episode(
     reasons: list[str] = []
     evidence: set[str] = set()
 
-    # 季维度
-    if target.season is not None and candidate.season is not None:
-        if target.season == candidate.season:
+    # 季维度。
+    # 四位数季号（S2026）是播出年份写法，不是节目第几季：你好星期六的
+    # S2026E08 在 TMDB 里是第 8 季，直接与 TMDB 季号比会判成「季不符」扣分，
+    # 年度编号的综艺整体被压低，落位就容易输给同期的其他候选。
+    # 这类季号不参与季比较，交给下面的年份映射。
+    target_season = target.season
+    if target_season is not None and target_season >= 1900:
+        target_season = None
+
+    if target_season is not None and candidate.season is not None:
+        if target_season == candidate.season:
             score += SCORE_SEASON_HIT
-            reasons.append(f'季一致 S{target.season:02d}')
+            reasons.append(f'季一致 S{target_season:02d}')
         else:
             score -= SCORE_SEASON_HIT
-            reasons.append(f'季不符 S{target.season:02d}≠S{candidate.season:02d}')
+            reasons.append(f'季不符 S{target_season:02d}≠S{candidate.season:02d}')
     elif target.year is not None and candidate.season is not None:
         mapped = index.year_of_season(candidate.season)
         if mapped == target.year:
             score += SCORE_SEASON_YEAR_HIT
             reasons.append(f'年份映射一致 {target.year}→S{candidate.season:02d}')
-    elif target.season is not None and candidate.year is not None:
+    elif target_season is not None and candidate.year is not None:
         mapped_season = index.season_of_year(candidate.year)
-        if mapped_season == target.season:
+        if mapped_season == target_season:
             score += SCORE_SEASON_YEAR_HIT
             reasons.append(f'季一致（按年份 {candidate.year}）')
 
