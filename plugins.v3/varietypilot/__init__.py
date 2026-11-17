@@ -212,7 +212,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.12'
+    plugin_version = '2.1.13'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -1152,18 +1152,46 @@ class VarietyPilot(_PluginBase):
 
         if not matched:
             return None
-        if len(matched) > 1 and (parsed is None or parsed.subtype is None):
-            # 同一个站点编号下挂着好几条不同类型的任务（加更、纯享、彩蛋共用
-            # S03E23 这种编号），而文件名里没写类型，挑哪条都是猜。
-            # 挑错的代价是把加更改到纯享那一集，还得人工进媒体库收拾，
-            # 所以这次不改，等下次扫描用副标题把类型补上。
-            logger.warning(
-                '综艺衍生内容管家：%s 命中 %d 条候选任务但文件未标明衍生类型，本次不改名：%s',
-                original,
-                len(matched),
-                '、'.join(f'{task.sxx_name}({task.subtype})' for task in matched),
-            )
-            return None
+        if len(matched) > 1:
+            # 同一个站点编号下挂着好几条内容：音乐缘计划把每期的衍生都编成
+            # S03E01，靠英文后缀区分（Coming 音乐人来了 / Gathering 歌手集结 /
+            # Documentary 全纪实），奔跑吧则用 S13E05P 这种字母后缀。
+            # 只按编号取第一条，就会把「音乐人来了」改到「歌手集结」那一集上——
+            # 现场就是这样把 S00E86 改成了 S00E88。
+            #
+            # 任务里存着下载时的完整种子名，文件名的种子名部分必然带着它，
+            # 拿它逐字比对就能唯一确定是哪一条，不需要看懂后缀是什么意思。
+            file_key = _release_key(original)
+            keyed = [
+                task for task in matched
+                if _release_key(task.title) and _release_key(task.title) in file_key
+            ]
+            if len(keyed) == 1:
+                return keyed[0]
+            if len(keyed) > 1:
+                # 多条任务的种子名都出现在文件名里（整季包、合集），
+                # 类型的权重比顺序靠谱
+                same_type = [task for task in keyed if task.subtype == (parsed.subtype if parsed else None)]
+                return same_type[0] if same_type else keyed[0]
+            if parsed is None or parsed.subtype is None:
+                # 种子名认不出唯一一条、文件名又没标类型，挑哪条都是猜。
+                # 挑错的代价是把这条内容塞进别人那一集，还得人工进媒体库收拾，
+                # 所以这次不改，等下次扫描用副标题把类型补上。
+                logger.warning(
+                    '综艺衍生内容管家：%s 命中 %d 条候选任务但无法确定是哪一条，本次不改名：%s',
+                    original,
+                    len(matched),
+                    '、'.join(f'{task.sxx_name}({task.subtype})' for task in matched),
+                )
+                return None
+            # 种子名一条都对不上（可能被工具改过名），退回按类型唯一确定：
+            # 同一站点编号下的加更、纯享、彩蛋类型各不相同，类型能唯一命中就用它。
+            same_type = [task for task in matched if task.subtype == parsed.subtype]
+            if len(same_type) == 1:
+                return same_type[0]
+            if len(same_type) > 1:
+                return same_type[0]
+            return matched[0]
         return matched[0]
 
     @staticmethod

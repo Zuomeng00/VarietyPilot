@@ -218,6 +218,75 @@ def test_year_season_scoring() -> None:
     assert not any('季不符' in line for line in results[0].reasons), results[0].reasons
 
 
+def test_same_site_number_selects_right_one() -> None:
+    """站点同一编号下挂多条内容时，不能取第一条就改。
+
+    音乐缘计划把每期的衍生都编成 S03E01，靠英文后缀区分：
+    Coming（音乐人来了）/ Gathering（歌手集结）/ Documentary（全纪实）。
+    现场就是只按编号取第一条，把 S00E86 的「音乐人来了」改成了
+    S00E88 的「第 88 集」。
+    """
+    cases = [
+        # (任务集号, 集名, 种子名, 文件名, 期望)
+        (
+            86, '第3季 第1期音乐人来了：岳薇诉说宇宙孤寂感',
+            'Melody Journey S03E01 Coming 2026 2160p iQIYI WEB-DL H265 DDP2.0-ADWeb',
+            '音乐缘计划.音乐人来了.Melody.Journey.S03E01.Coming.2026.2160p.iQIYI.WEB-DL.H265.DDP2.0-ADWeb.mkv',
+            86,
+        ),
+        (
+            87, '第3季 第1期全纪实：薛之谦被花式挑衅',
+            'Melody Journey S03E01Documentary 2026 2160p iQIYI WEB-DL H265 DDP2.0-ADWeb',
+            '音乐缘计划.Melody.Journey.S03E01Documentary.2026.2160p.iQIYI.WEB-DL.H265.DDP2.0-ADWeb.mkv',
+            87,
+        ),
+        (
+            88, '第3季 第2期歌手集结：刘宇宁打地鼠手速加倍玩疯了',
+            'Melody Journey S03E01Gathering 2026 2160p iQIYI WEB-DL H265 DDP2.0-ADWeb',
+            '音乐缘计划.Melody.Journey.S03E01Gathering.2026.2160p.iQIYI.WEB-DL.H265.DDP2.0-ADWeb.mkv',
+            88,
+        ),
+    ]
+    tasks = [
+        _task('音乐缘计划', seed, 3, 1, None)
+        for _, _, seed, _, _ in cases
+    ]
+    for task, (episode, name, _, _, _) in zip(tasks, cases):
+        task.sxx_episode = episode
+        task.sxx_name = name
+    tasks[0].subtype, tasks[0].subtype_word = 'extra', '音乐人来了'
+    tasks[1].subtype, tasks[1].subtype_word = 'uncut', '全纪实'
+    tasks[2].subtype, tasks[2].subtype_word = None, ''
+
+    plugin = _plugin(*tasks)
+    wrong = []
+    for episode, _, _, filename, expect in cases:
+        hit = plugin._match_task(_rename('音乐缘计划', filename, 3, 1))
+        got = hit.sxx_episode if hit else None
+        if got != expect:
+            wrong.append(f'期望 S00E{expect} 实际 {got}')
+    assert not wrong, '；'.join(wrong)
+
+
+def test_letter_suffix_not_swapped() -> None:
+    """站点的字母后缀（S13E05P 纯享 / S13E05 正片衍生）也要能分开。"""
+    plain = _task('奔跑吧', 'Keep Running S13E05 2026 2160p WEB-DL', 13, 5, 'plus_bonus')
+    plain.sxx_episode = 200
+    pure = _task('奔跑吧', 'Keep Running S13E05P 2026 2160p WEB-DL', 13, 5, 'pure')
+    pure.sxx_episode = 201
+    plugin = _plugin(plain, pure)
+
+    hit = plugin._match_task(
+        _rename('Keep Running', 'Keep.Running.S13E05P.2026.2160p.WEB-DL.mkv', 13, 5)
+    )
+    assert hit is not None and hit.sxx_episode == 201, f'纯享落错：{hit.sxx_episode if hit else None}'
+
+    hit = plugin._match_task(
+        _rename('Keep Running', 'Keep.Running.S13E05.2026.2160p.WEB-DL.mkv', 13, 5)
+    )
+    assert hit is not None and hit.sxx_episode == 200, f'加更落错：{hit.sxx_episode if hit else None}'
+
+
 def test_type_from_description_only() -> None:
     """类型只写在副标题里、种子名和文件名都不带类型词，也要能认回。"""
     task = _task('音乐缘计划', 'Melody Journey S03E01 2026 1080p iQIYI WEB-DL', 3, 1, 'uncut')
@@ -286,6 +355,8 @@ def main() -> int:
     checks = [
         ('十部综艺回连', test_multi_show_landing),
         ('组名位置错位', test_group_name_moved),
+        ('同号多内容分流', test_same_site_number_selects_right_one),
+        ('字母后缀不串', test_letter_suffix_not_swapped),
         ('年度季号解析', test_year_season_parsed),
         ('年度季号路径改写', test_year_season_renamed),
         ('年度季号落位打分', test_year_season_scoring),
@@ -306,7 +377,7 @@ def main() -> int:
         for line in failures:
             print('  -', line)
         return 1
-    print(f'全部通过：{len(LANDED)} 部综艺回连 + 8 项边界与反例')
+    print(f'全部通过：{len(LANDED)} 部综艺回连 + 10 项边界与反例')
     return 0
 
 
