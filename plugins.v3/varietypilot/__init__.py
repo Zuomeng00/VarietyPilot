@@ -114,6 +114,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'guard_unmatched': False,
     'skip_subtypes': ['clip'],
     'index_ttl_hours': 12,
+    # 一次性清理：填 `TMDBID:S00E88` 或 `剧名:S00E88`，保存配置即删除对应任务记录
+    'forget_records': '',
 }
 
 
@@ -212,7 +214,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.13'
+    plugin_version = '2.1.14'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -233,6 +235,7 @@ class VarietyPilot(_PluginBase):
     _data_path: Optional[Path] = None
     _last_scan_at: float = 0.0
     _last_report: str = ''
+    _forget_note: str = ''
     _last_records: List[Dict[str, Any]] = []
     _scanning: bool = False
 
@@ -246,6 +249,7 @@ class VarietyPilot(_PluginBase):
         self._config = dict(DEFAULT_CONFIG)
         self._last_records = []
         self._media_cache: Dict[int, Any] = {}
+        self._forget_note = ''
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ 配置
@@ -288,6 +292,8 @@ class VarietyPilot(_PluginBase):
             self._load_auto_shows()
 
         self._rebuild_shows()
+        # 一次性清理：放在 _rebuild_shows 之后，才能按剧名反查 TMDB ID
+        self._forget_note = self._apply_forget(merged.get('forget_records'))
         logger.info(
             f'综艺衍生内容管家：配置已生效，状态={"启用" if self._enabled else "停用"}，'
             f'手动 {len(self._manual_shows)} 部 / 订阅 {len(self._auto_shows)} 部，'
@@ -298,6 +304,67 @@ class VarietyPilot(_PluginBase):
 
     def get_state(self) -> bool:
         return bool(self._enabled)
+
+    # ------------------------------------------------------------ 记录删除
+
+    def _apply_forget(self, raw: Any) -> str:
+        """按配置一次性删除任务记录（删掉后该内容会重新下载）。
+
+        为什么需要这个入口：任务记录是「已下载过」的唯一依据。某条记录指向了
+        错的集（站点同号内容串了、文件被别的资源占了），只有把记录删掉，下一轮
+        扫描才会重新下。记录常驻内存，手工改 tasks.json 会被下一次写入覆盖，
+        所以必须由插件自己删。
+
+        配置写法：`TMDBID:S00E88`、`剧名:S00E88`，多行或逗号分隔，
+        `*:S00E88` 表示所有跟踪的剧。
+        """
+        text = str(raw or '').strip()
+        if not text or self._store is None:
+            return ''
+        if text == self.get_data('forget_applied'):
+            # 同一批已经处理过：不清空配置也不会把后来重新下载生成的记录再删一次
+            return ''
+        removed: List[str] = []
+        parsed = 0
+        for item in re.split(r'[\n,;，；]+', text):
+            item = item.strip().replace('：', ':')
+            if not item or ':' not in item:
+                continue
+            ident, _, tail = item.partition(':')
+            match = re.search(r'(\d{1,4})\s*$', tail.strip())
+            if not match:
+                continue
+            parsed += 1
+            episode = int(match.group(1))
+            for tmdb_id in self._resolve_forget_ids(ident.strip()):
+                task = self._store.get(tmdb_id, episode)
+                if task is None:
+                    continue
+                self._store.remove(tmdb_id, episode)
+                removed.append(f'{task.show_name} S00E{episode:02d}《{task.sxx_name}》')
+        if not parsed:
+            # 写法不完整（只写剧名、只写集号）时什么都不做，避免误删整部剧
+            return ''
+        self.save_data('forget_applied', text)
+        if not removed:
+            logger.warning(f'综艺衍生内容管家：删除记录「{text}」没找到对应任务，检查剧名或集号')
+            return f'没找到对应记录（{text}）'
+        logger.info(f'综艺衍生内容管家：已删除任务记录 {"、".join(removed)}')
+        return '已删除 ' + '、'.join(removed[:5])
+
+    def _resolve_forget_ids(self, ident: str) -> List[int]:
+        """把 `231620` / `音乐缘计划` / `*` 换成 TMDB ID 列表。"""
+        if ident in ('*', '', 'all'):
+            return [show.tmdb_id for show in self._shows]
+        if ident.isdigit():
+            return [int(ident)]
+        ids: List[int] = []
+        for show in self._shows:
+            for name in [show.name, *show.aliases]:
+                if name and (ident == name or ident in name or name in ident):
+                    ids.append(show.tmdb_id)
+                    break
+        return ids
 
     @staticmethod
     def _parse_site_ids(raw: Any) -> List[int]:
@@ -667,6 +734,12 @@ class VarietyPilot(_PluginBase):
         """执行一轮扫描，返回 (提交数量, 文本汇总)。"""
         if self._store is None or self._index_store is None:
             return 0, '插件尚未初始化，请先保存配置'
+
+        # 配置里的「删除任务记录」在保存时若没赶上（插件未启用/未重载），
+        # 这里再补一次；同一段文字只生效一次，不会把重下的记录反复删掉
+        note = self._apply_forget(self._config.get('forget_records'))
+        if note:
+            self._forget_note = note
 
         sync_note = ''
         if _to_bool(self._config.get('sync_subscribe'), True):
@@ -1309,6 +1382,14 @@ class VarietyPilot(_PluginBase):
                 'description': '站点已发布但 TMDB 特别季尚未登记的内容，用于排查「为什么没下」',
             },
             {
+                'path': '/forget',
+                'endpoint': self.api_forget,
+                'methods': ['POST'],
+                'auth': 'bear',
+                'summary': '删除任务记录',
+                'description': '删掉指定记录后该内容会重新下载，写法 231620:S00E88',
+            },
+            {
                 'path': '/clear',
                 'endpoint': self.api_clear,
                 'methods': ['POST'],
@@ -1452,6 +1533,16 @@ class VarietyPilot(_PluginBase):
             for miss in self._store.misses(limit=min(max(limit, 1), 300))
         ]
         return {'success': True, 'message': f'共 {len(rows)} 条', 'data': rows}
+
+    def api_forget(self, ids: str = '') -> Dict[str, Any]:
+        """删除任务记录，让对应内容在下一轮重新下载。"""
+        if self._store is None:
+            return {'success': False, 'message': '插件尚未初始化'}
+        if not str(ids or '').strip():
+            return {'success': False, 'message': '请填写要删除的记录，写法 231620:S00E88'}
+        note = self._apply_forget(ids)
+        ok = note.startswith('已删除')
+        return {'success': ok, 'message': note or '没有可删除的记录'}
 
     def api_clear(self, status: str = '') -> Dict[str, Any]:
         if self._store is None:
@@ -1742,6 +1833,33 @@ class VarietyPilot(_PluginBase):
                     {
                         'component': 'VRow',
                         'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'forget_records',
+                                            'label': '删除任务记录（一次性）',
+                                            'placeholder': '例：231620:S00E88',
+                                            'hint': (
+                                                '填上并保存配置，就删掉这条记录，下一轮扫描会重新下载；'
+                                                '不会删除已经入库的文件。写法：TMDB ID 或剧名 + 英文冒号 + '
+                                                'S00 集号，多个用逗号隔开，* 表示所有跟踪的剧。'
+                                                '删完可以把这里清空，留着也不会重复删。'
+                                            ),
+                                            'persistent-hint': True,
+                                            'clearable': True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
                             self._switch('guard_unmatched', '未接管资源也强制进特别季', 6),
                             {
                                 'component': 'VCol',
@@ -1807,23 +1925,23 @@ class VarietyPilot(_PluginBase):
         stats = self._store.stats() if self._store else {}
         recent = self._store.recent(limit=15) if self._store else []
 
-        head = self._card(
-            '运行概况',
-            [
-                ('跟踪剧集', f'{len(self._shows)} 部'),
-                ('总任务', f'{stats.get("total", 0)} 条'),
-                ('待入库', f'{stats.get(STATUS_SUBMITTED, 0) + stats.get(STATUS_QUEUED, 0)} 条'),
-                ('已入库', f'{stats.get(STATUS_DONE, 0)} 条'),
-                (
-                    '上次扫描',
-                    datetime.fromtimestamp(self._last_scan_at).strftime('%Y-%m-%d %H:%M')
-                    if self._last_scan_at
-                    else '尚未扫描',
-                ),
-                ('预演模式', '开' if _to_bool(self._config.get('dry_run'), True) else '关'),
-                ('不下载的类型', self._skip_label()),
-            ],
-        )
+        overview: List[Tuple[str, str]] = [
+            ('跟踪剧集', f'{len(self._shows)} 部'),
+            ('总任务', f'{stats.get("total", 0)} 条'),
+            ('待入库', f'{stats.get(STATUS_SUBMITTED, 0) + stats.get(STATUS_QUEUED, 0)} 条'),
+            ('已入库', f'{stats.get(STATUS_DONE, 0)} 条'),
+            (
+                '上次扫描',
+                datetime.fromtimestamp(self._last_scan_at).strftime('%Y-%m-%d %H:%M')
+                if self._last_scan_at
+                else '尚未扫描',
+            ),
+            ('预演模式', '开' if _to_bool(self._config.get('dry_run'), True) else '关'),
+            ('不下载的类型', self._skip_label()),
+        ]
+        if self._forget_note:
+            overview.append(('删除记录', self._forget_note))
+        head = self._card('运行概况', overview)
 
         rows: List[dict] = [
             {
