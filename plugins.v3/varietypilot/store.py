@@ -175,10 +175,16 @@ class TaskStore:
             logger.warning(f'综艺衍生内容管家：任务写入失败（{err}）')
 
     def _prune_locked(self) -> None:
-        """超限时优先淘汰已完成且较早的记录。"""
+        """超限时优先淘汰已完成且较早的记录。
+
+        排序第一维是「未完成」，配合 reverse=True 让未完成的任务排在前面被保留，
+        已完成的老记录排在后面先淘汰。这一维原来写成了「已完成」，方向正好相反：
+        任务数一超限就把还没入库的活跃任务删掉，整理阶段找不到任务、文件落错季。
+        第二维按更新时间，同状态里新的留下。
+        """
         ordered = sorted(
             self._tasks.values(),
-            key=lambda task: (task.status in (STATUS_DONE, STATUS_SKIPPED), task.updated_at),
+            key=lambda task: (task.status not in (STATUS_DONE, STATUS_SKIPPED), task.updated_at),
             reverse=True,
         )
         keep = {task.key for task in ordered[: self._max]}

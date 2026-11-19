@@ -214,7 +214,7 @@ class VarietyPilot(_PluginBase):
     plugin_name = '综艺衍生内容管家'
     plugin_desc = '把加更/彩蛋/纯享等衍生内容按 TMDB 特别季准确落位到 Season 00，自动跟踪 MP 订阅里的综艺，不占正片集号，极影视与 Emby 均可正常入库。'
     plugin_icon = 'mdi-television-classic'
-    plugin_version = '2.1.14'
+    plugin_version = '2.1.15'
     plugin_author = '阿白'
     author_url = ''
     plugin_config_prefix = 'varietypilot_'
@@ -720,18 +720,50 @@ class VarietyPilot(_PluginBase):
     # ------------------------------------------------------------------- 扫描
 
     def scan_task(self) -> None:
-        """定时任务入口。"""
-        if not self._enabled or self._scanning:
+        """定时任务入口。
+
+        预约扫描标志也放进锁里：调度器和手动扫描可能同时到，
+        先检查后置位会两边都通过，各跑一轮、重复搜站占集号。
+        """
+        if not self._enabled:
             return
-        self.run_scan(dry_run=_to_bool(self._config.get('dry_run'), True))
+        with self._lock:
+            if self._scanning:
+                logger.debug('综艺衍生内容管家：已有扫描在进行，本轮定时任务跳过')
+                return
+            self._scanning = True
+        self.run_scan(dry_run=_to_bool(self._config.get('dry_run'), True), claimed=True)
 
     def run_scan(
         self,
         dry_run: Optional[bool] = None,
         only_show: str = '',
         force_sync: bool = False,
+        claimed: bool = False,
     ) -> Tuple[int, str]:
-        """执行一轮扫描，返回 (提交数量, 文本汇总)。"""
+        """执行一轮扫描，返回 (提交数量, 文本汇总)。
+
+        :param claimed: 调用方已经在锁内预约过扫描标志（api_scan 这样做，避免
+            并发请求各起一条线程）；为 True 时不重复置位，但退出时统一负责清除。
+        """
+        if not claimed:
+            with self._lock:
+                self._scanning = True
+        try:
+            return self._run_scan_impl(dry_run, only_show, force_sync)
+        finally:
+            # 未初始化、未配剧集这类提前返回也必须释放标志，
+            # 否则 api_scan 预约过一次之后，扫描再也触发不了
+            with self._lock:
+                self._scanning = False
+
+    def _run_scan_impl(
+        self,
+        dry_run: Optional[bool] = None,
+        only_show: str = '',
+        force_sync: bool = False,
+    ) -> Tuple[int, str]:
+        """扫描主体，扫描标志由 run_scan 统一管理。"""
         if self._store is None or self._index_store is None:
             return 0, '插件尚未初始化，请先保存配置'
 
@@ -765,50 +797,44 @@ class VarietyPilot(_PluginBase):
         if not targets:
             return 0, f'未找到剧集：{only_show}'
 
-        with self._lock:
-            self._scanning = True
         lines: List[str] = []
         lines.extend(self._site_warnings())
         if sync_note:
             lines.append(sync_note)
         submitted = 0
         collected: List[Dict[str, Any]] = []
-        try:
-            for show in targets:
-                try:
-                    index = self._index_store.load(show.tmdb_id, show.name)
-                except Exception as err:  # noqa: BLE001
-                    lines.append(f'{show.name}：特别季索引获取失败（{err}）')
-                    continue
-                report = scan_show(
-                    show=show,
-                    index=index,
-                    store=self._store,
-                    options=self._options,
-                    search_fn=self._search,
-                    download_fn=None if dry else self._download,
-                    dry_run=dry,
-                )
-                submitted += report.submitted
-                collected.extend(report.records)
-                # 页面上的完整明细：每部剧一行统计，加上逐条去向
-                lines.append(report.line())
-                for detail in report.details[:20]:
-                    lines.append(f'  · {detail}')
-            if len(collected) > 20:
-                lines.append(f'每条资源的落位与原因共 {len(collected)} 条，见插件页面「最近扫描明细」')
-            self._last_scan_at = time.time()
-            self._last_records = collected[-400:]
-            self._last_report = '\n'.join(lines)
-            # 通知只说这轮下了什么，跳过的逐条原因留在插件页面看
-            summary = self._notice_text(collected, dry)
-            if _to_bool(self._config.get('notify'), True) and (submitted or not dry):
-                title = '【综艺衍生内容】预演结果' if dry else '【综艺衍生内容】已提交下载'
-                self.post_message(title=title, text=summary[:1500])
-            return submitted, summary
-        finally:
-            with self._lock:
-                self._scanning = False
+        for show in targets:
+            try:
+                index = self._index_store.load(show.tmdb_id, show.name)
+            except Exception as err:  # noqa: BLE001
+                lines.append(f'{show.name}：特别季索引获取失败（{err}）')
+                continue
+            report = scan_show(
+                show=show,
+                index=index,
+                store=self._store,
+                options=self._options,
+                search_fn=self._search,
+                download_fn=None if dry else self._download,
+                dry_run=dry,
+            )
+            submitted += report.submitted
+            collected.extend(report.records)
+            # 页面上的完整明细：每部剧一行统计，加上逐条去向
+            lines.append(report.line())
+            for detail in report.details[:20]:
+                lines.append(f'  · {detail}')
+        if len(collected) > 20:
+            lines.append(f'每条资源的落位与原因共 {len(collected)} 条，见插件页面「最近扫描明细」')
+        self._last_scan_at = time.time()
+        self._last_records = collected[-400:]
+        self._last_report = '\n'.join(lines)
+        # 通知只说这轮下了什么，跳过的逐条原因留在插件页面看
+        summary = self._notice_text(collected, dry)
+        if _to_bool(self._config.get('notify'), True) and (submitted or not dry):
+            title = '【综艺衍生内容】预演结果' if dry else '【综艺衍生内容】已提交下载'
+            self.post_message(title=title, text=summary[:1500])
+        return submitted, summary
 
     # --------------------------------------------------------------- 外部调用
 
@@ -1135,7 +1161,16 @@ class VarietyPilot(_PluginBase):
             season = _get_field(meta, 'season')
             episode = _get_field(meta, 'episode')
             if tmdb_id and season is not None and episode is not None:
-                task = self._store.find_by_source(tmdb_id, _to_int(season, -1), _to_int(episode, -1))
+                season_no = _to_int(season, -1)
+                episode_no = _to_int(episode, -1)
+                if season_no == 0:
+                    # 季号已经被 _align_meta 改写成 S00，这里的 episode 是插件
+                    # 落位的目标特别集号，不是站点源集号。拿源季/源集
+                    # （比如 S03E01）去 find_by_source 永远查不到，任务就一直
+                    # 停在「已提交」不入库。
+                    task = self._store.get(tmdb_id, episode_no)
+                if not task:
+                    task = self._store.find_by_source(tmdb_id, season_no, episode_no)
         if not task:
             return
 
@@ -1448,17 +1483,27 @@ class VarietyPilot(_PluginBase):
         搜索要打站点，几部剧跑下来可能几分钟，不能让 HTTP 请求干等，
         所以放到后台线程执行，结果在插件页「上次扫描」里看。
         """
-        if self._scanning:
-            return {'success': False, 'message': '已有扫描在进行中，请稍后再试', 'data': {}}
-        if self._store is None or self._index_store is None:
-            return {'success': False, 'message': '插件尚未初始化，请先保存配置', 'data': {}}
-        thread = threading.Thread(
-            target=self.run_scan,
-            kwargs={'dry_run': dry_run, 'only_show': show},
-            name='VarietyPilotScan',
-            daemon=True,
-        )
-        thread.start()
+        # 检查与置位必须在同一把锁内完成，否则两个并发请求都看到 False，
+        # 各自启动一条扫描线程，重复搜站、重复占集号
+        with self._lock:
+            if self._scanning:
+                return {'success': False, 'message': '已有扫描在进行中，请稍后再试', 'data': {}}
+            if self._store is None or self._index_store is None:
+                return {'success': False, 'message': '插件尚未初始化，请先保存配置', 'data': {}}
+            self._scanning = True
+        try:
+            thread = threading.Thread(
+                target=self.run_scan,
+                kwargs={'dry_run': dry_run, 'only_show': show, 'claimed': True},
+                name='VarietyPilotScan',
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            # 线程没起来就回滚标志，否则扫描再也触发不了
+            with self._lock:
+                self._scanning = False
+            raise
         scope = f'（仅 {show}）' if show else ''
         return {
             'success': True,

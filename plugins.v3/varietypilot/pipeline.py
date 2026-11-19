@@ -27,7 +27,14 @@ from .store import (
     Task,
     TaskStore,
 )
-from .titles import SUBTYPE_LABELS, ParsedTitle, parse_release, strip_show_name, subtype_label
+from .titles import (
+    ONE_OFF_SUBTYPES,
+    SUBTYPE_LABELS,
+    ParsedTitle,
+    parse_release,
+    strip_show_name,
+    subtype_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -492,8 +499,12 @@ def signature_of(parsed: Any) -> str:
     if episode is None and not segment:
         return ''
     season = parsed.season
-    if season is not None and season >= 1900 and season == parsed.site_season:
-        # 四位数的「季号」其实是年份写法，各站不统一，不能当内容特征
+    if season is not None and season >= 1900:
+        # 四位数的「季号」其实是年份写法，各站不统一：有的写成 S2026
+        # （season=2026、site_season=2026），有的裸写 2026（season=2026、
+        # site_season=None）。打分侧对 >=1900 的季号一律当年份忽略，
+        # 指纹侧也必须一致，否则同一份内容算出两个 content_key，
+        # TMDB 补录集号后移时就会被当成新内容重复下载。
         season = None
     return '|'.join(
         [
@@ -851,6 +862,18 @@ def scan_show(
 
     # 扫到了衍生内容但 TMDB 特别季里没有登记：记录下来等下一轮，不静默丢弃
     head_lines: list[str] = []
+
+    def _miss_reason(parsed: ParsedTitle) -> str:
+        """一次性内容（特辑/彩蛋/先导）没副标题时，缺的是期号，不是 TMDB 数据。"""
+        if (
+            parsed.subtype in ONE_OFF_SUBTYPES
+            and parsed.episode is None
+            and not parsed.segment
+            and not parsed.air_date
+        ):
+            return '资源名没写副标题，认不出是第几期，等站点带上副标题后再认'
+        return 'TMDB 特别季暂无对应集，等待补齐'
+
     for title, parsed in unmatched[:40]:
         store.record_miss(
             MissRecord(
@@ -860,7 +883,7 @@ def scan_show(
                 season=parsed.season,
                 episode=parsed.episode,
                 subtype=parsed.subtype,
-                reason='TMDB 特别季暂无对应集，等待补齐',
+                reason=_miss_reason(parsed),
             )
         )
     if unmatched:
@@ -878,10 +901,10 @@ def scan_show(
                     'seeders': 0,
                     'free': False,
                     'status': '等待',
-                    'reason': 'TMDB 特别季暂无对应集，已记录等待补齐',
+                    'reason': f'{_miss_reason(parsed)}（已记录）',
                 }
             )
-        head_lines.append(f'{len(unmatched)} 条衍生内容在 TMDB 特别季中暂无对应集，已记录等待')
+        head_lines.append(f'{len(unmatched)} 条衍生内容没找到对应集，已记录等待（原因见明细）')
 
     if season_filtered:
         head_lines.append(

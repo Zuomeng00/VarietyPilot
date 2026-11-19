@@ -206,7 +206,6 @@ _RE_FEATURE = re.compile(r'正片')
 # 片段名：副标题冒号后的内容（「第04期加更：白敬亭林一…」），
 # 或 TMDB 集名里「·」后的内容（「第4季 第4期下纯享·小画家」）。
 # 同一期的多个纯享片段只有这一层信息能区分开，是精确落位的最后手段。
-_RE_SEGMENT_COLON = re.compile(r'[：:]\s*(.+)$')
 _RE_SEGMENT_DOT = re.compile(r'[·・]\s*(.+)$')
 # 省略号/尾部标点会污染比对
 _RE_TRAILING_DOTS = re.compile(r'[….．\s]+$')
@@ -354,16 +353,18 @@ def _extract_segment(text: str) -> Optional[str]:
     冒号后是这一条衍生内容的片段名；TMDB 集名形如「第4季 第4期下纯享·小画家」，
     「·」后是同一个片段名。两者对上，说明就是同一段视频。
     """
-    for pattern in (_RE_SEGMENT_COLON, _RE_SEGMENT_DOT):
-        m = pattern.search(text)
-        if not m:
+    # 冒号可能不止一个：「现在就出发：第四季 第04期纯享：小画家」去掉剧名后
+    # 还留着前导冒号，第一个冒号前缀既没有期号也没有类型词，那不是片段名的
+    # 分隔符。要依次往后找，而不是碰上第一个冒号判失败就整个放弃——
+    # 放弃的后果是不同片段算出同一个指纹，第二份被当成重复内容吞掉。
+    for m in re.finditer(r'[：:]', text):
+        prefix = text[: m.start()]
+        if not (_RE_EPISODE_CN.search(prefix) or detect_subtype(prefix)[0]):
             continue
-        # 冒号前必须已经出现期号或类型词，否则那是剧名自带的分隔符
-        # （如「现在就出发：第四季 第04期加更」），不是片段名
-        if pattern is _RE_SEGMENT_COLON:
-            prefix = text[:m.start()]
-            if not (_RE_EPISODE_CN.search(prefix) or detect_subtype(prefix)[0]):
-                continue
+        value = _RE_TRAILING_DOTS.sub('', text[m.end():]).strip(' -_|')
+        if len(value) >= 2:
+            return value
+    if m := _RE_SEGMENT_DOT.search(text):
         value = _RE_TRAILING_DOTS.sub('', m.group(1)).strip(' -_|')
         if len(value) >= 2:
             return value
@@ -484,6 +485,14 @@ def parse_release(title: str, description: str = '') -> ParsedTitle:
     parsed = parse_title(title or '')
     description = (description or '').strip()
     if not description:
+        # 没有副标题也不能把 Special / Eggs / Prologue 这类一次性内容的
+        # 站点集号当成真实期号：同一份资源带副标题时能落位、不带副标题时
+        # 拿着发布序号去抢某一集，才是真正会刮错的那种不稳定。
+        # 只清「站点序号」来的期号——标题里明写的「第X期」是真期号，留着。
+        if parsed.subtype in ONE_OFF_SUBTYPES and parsed.episode_source == 'site':
+            parsed.episode = None
+            parsed.episode_source = ''
+            parsed.signals.append('一次性特别:不采用站点集号')
         return parsed
 
     extra = parse_title(description)
@@ -522,7 +531,12 @@ def parse_release(title: str, description: str = '') -> ParsedTitle:
 
     # 「毛雪汪 S01E02 Special」这类一次性特别内容没有期号概念，
     # 站点 E02 只是发布序号，拿去和 TMDB 的「第X期」比必然错位。
-    if extra.episode is None and parsed.subtype in ONE_OFF_SUBTYPES:
+    # 同样只清站点序号：标题或副标题里明写的「第X期」是真期号。
+    if (
+        extra.episode is None
+        and parsed.subtype in ONE_OFF_SUBTYPES
+        and parsed.episode_source == 'site'
+    ):
         parsed.episode = None
         parsed.episode_source = ''
         parsed.signals.append('一次性特别:不采用站点集号')
