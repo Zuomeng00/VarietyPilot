@@ -39,15 +39,24 @@ SUBTYPE_ALIASES: dict[str, tuple[str, ...]] = {
         '会员加更版', '会员加更', '特别加更', '超前加更', '还有加更', '再次加更',
         '二次加更', '再加更', '又加更', '超长加更', '轻加更', '加料版',
         '加更版', '加更',
+        # 「加码」是爱奇艺/腾讯对加更的叫法（偏爱之恋 第二季 加码：…），
+        # 站点资源名写成 `S02E02 Extra`。两边都按加更处理，才能和 TMDB 对上。
+        '加码版', '加码',
         # 未删减 / 完整版：同一期素材的完整放出，性质上就是加长
         '未删减版', '无删减版', '未删减', '无删减', '会员完整版', '完整版',
         '导演剪辑版', '加映版', '加映',
         # 站点资源名常直接写英文 Plus，如 `Natural High S04E08 Plus`
         'plus', 'uncensored', 'extended',
+        # `Love Wins All S02E02 Extra`：站点用 Extra 标额外放出的内容
+        'extra',
     ),
     'pure': (
         '单人纯享', '嘉宾纯享', '看点纯享', '纯享版', '纯享',
         '精编版', '精华版', '高光时刻', '高光', '精华',
+        # 芒果「沉浸版」是把正片重剪成沉浸式的一个版本，性质和纯享一样，
+        # 站点资源名写 `I Miss You S01E09 Immersive`。
+        # 只认「沉浸版」不认裸「沉浸」，避免「沉浸式体验」这类描述被当成类型词。
+        '沉浸版', 'immersive',
     ),
     'bonus': (
         'VIP彩蛋', 'vip彩蛋', '独家彩蛋', '精彩彩蛋', '彩蛋版', '彩蛋篇',
@@ -66,8 +75,8 @@ SUBTYPE_ALIASES: dict[str, tuple[str, ...]] = {
         '开播先导', '先导片上', '先导片下', '先导片', '先导集', '先导',
         '预告片', '下期预告', '高能预警', '抢鲜看', '抢先看', '抢鲜', '预告',
         '序章', '前瞻', '预热',
-        # 站点资源名直接写英文 Prologue / Prelude
-        'prologue', 'prelude',
+        # 站点资源名直接写英文 Prologue / Prelude / Preview / Peek
+        'prologue', 'prelude', 'preview', 'peek',
     ),
     'special': (
         '名场面特辑', '游戏特辑', '院人特辑', '特别企划', '复盘特辑', '案情回顾',
@@ -112,8 +121,8 @@ SUBTYPE_LABELS: dict[str, str] = {
 # 下拉选择用的说明：给用户看「这一类里都有哪些叫法」，
 # 站点换个词也知道该关哪一项。顺序固定，不随字典顺序漂移。
 SUBTYPE_HINTS: dict[str, str] = {
-    'plus_bonus': '会员Plus版、加长版、悠享版、未删减版、完整版、特别加更、还有加更',
-    'pure': '纯享、单人纯享、精编版、高光时刻',
+    'plus_bonus': '会员Plus版、加长版、悠享版、未删减版、完整版、特别加更、还有加更、加码',
+    'pure': '纯享、单人纯享、精编版、高光时刻、沉浸版',
     'bonus': '彩蛋、番外、独家彩蛋',
     'uncut': '花絮、超长花絮、未播片段、幕后、母带放送、花絮集锦',
     'clip': '直拍、单人直拍、第一视角、Fancam、个人cut',
@@ -186,9 +195,12 @@ _RE_DATE_FULL = re.compile(r'(?<!\d)(20\d{2})[.\-_/年]?(\d{1,2})[.\-_/月]?(\d{
 _RE_DATE_MD = re.compile(r'(?<![\d.])(\d{1,2})[.\-_/月](\d{1,2})(?![\d.])日?')
 
 # 分P
+# 站点两种写法：「第06期上」直接黏在期号后，「第11期（上）」用括号包起来。
+# 括号这版很常见（花儿与少年、声生不息、后会友期），漏掉会让同一期的上下
+# 两集算成同一个指纹，后到的那条被当重复吞掉，落位也分不清上还是下。
 _RE_PART = re.compile(
-    r'(?:(?<=[\s.\-_\]】）期集0-9])|^)(上|下)(?:集|篇|部)?'
-    r'(?=$|[\s.\-_\[\]【（(：:·])'
+    r'(?:(?<=[\s.\-_\]】）期集0-9（(])|^)(上|下)(?:集|篇|部)?'
+    r'(?=$|[\s.\-_\[\]【（(：:·）)])'
 )
 # 「第4期上纯享」「第4期下加更」：上/下直接黏在类型词前，中间没有分隔符
 _RE_PART_BEFORE_SUBTYPE = re.compile(
@@ -209,6 +221,10 @@ _RE_FEATURE = re.compile(r'正片')
 _RE_SEGMENT_DOT = re.compile(r'[·・]\s*(.+)$')
 # 省略号/尾部标点会污染比对
 _RE_TRAILING_DOTS = re.compile(r'[….．\s]+$')
+# 站点副标题常在末尾挂别名与标签：「…惊喜合唱 | 声生不息·宝岛季2 / 声生不息2026」。
+# 这一截不属于片段名，留在里面会让同一条资源因为别名写法不同算出两个指纹，
+# 第二次扫描就被当成新内容重复下载。
+_RE_TAIL_ALIAS = re.compile(r'\s*[|｜]\s*')
 
 # 一次性特别内容：没有「第X期」的概念，站点集号只是发布序号
 ONE_OFF_SUBTYPES = frozenset({'special', 'bonus', 'prequel', 'live', 'clip'})
@@ -333,7 +349,8 @@ def _extract_part(text: str) -> Optional[str]:
         return m.group(1)
     # 「上/下」必须贴近类型词或位于结尾，避免「上海」这类误判
     for m in _RE_PART.finditer(text):
-        tail = text[m.end():].strip(' .-_')
+        # 括号写法「第11期（上）：…」：右括号要先剥掉再看后面接什么
+        tail = text[m.end():].lstrip('）)').strip(' .-_')
         if not tail:
             return m.group(1)
         # 形如「第4期下：小画家」：分P后面直接接片段名
@@ -346,6 +363,12 @@ def _extract_part(text: str) -> Optional[str]:
         if detect_subtype(tail[:6])[0]:
             return m.group(1)
     return None
+
+
+def _cut_alias(value: str) -> str:
+    """切掉片段名尾部的「| 别名 / 标签」，再清掉省略号和包裹符号。"""
+    value = _RE_TAIL_ALIAS.split(value, maxsplit=1)[0]
+    return _RE_TRAILING_DOTS.sub('', value).strip(' -_|/·')
 
 
 def _extract_segment(text: str) -> Optional[str]:
@@ -363,11 +386,11 @@ def _extract_segment(text: str) -> Optional[str]:
         prefix = text[: m.start()]
         if not (_RE_EPISODE_CN.search(prefix) or detect_subtype(prefix)[0]):
             continue
-        value = _RE_TRAILING_DOTS.sub('', text[m.end():]).strip(' -_|')
+        value = _cut_alias(text[m.end():])
         if len(value) >= 2:
             return value
     if m := _RE_SEGMENT_DOT.search(text):
-        value = _RE_TRAILING_DOTS.sub('', m.group(1)).strip(' -_|')
+        value = _cut_alias(m.group(1))
         if len(value) >= 2:
             return value
     return None
