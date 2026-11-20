@@ -346,6 +346,7 @@ def build_candidates(
     season_filtered: Optional[list[str]] = None,
     skip_subtypes: Optional[list[str]] = None,
     type_filtered: Optional[list[str]] = None,
+    feature_filtered: Optional[list[str]] = None,
 ) -> tuple[list[Candidate], int, int, list[tuple[str, ParsedTitle]]]:
     """把搜索结果转成候选列表。
 
@@ -355,6 +356,7 @@ def build_candidates(
         供扫描结果说明「为什么这一季的加更没下」。
     :param skip_subtypes: 用户关掉的衍生类型；命中的资源一律不收。
     :param type_filtered: 非空时，把因类型被关掉而排除的资源标题写进去。
+    :param feature_filtered: 非空时，把副标题标了「正片」、因而不归插件管的标题写进去。
     :return: (候选, 衍生条数, 成功匹配条数, 未匹配的衍生标题及解析结果)
     """
     names = show.search_names
@@ -378,6 +380,14 @@ def build_candidates(
         if parsed.is_pack:
             # 整季包不进衍生链路：包里的正片该由订阅处理，衍生内容也分不出来，
             # 收进来只会白占一个集号，还会一直挂在「等待 TMDB 补齐」里
+            continue
+        # 副标题写「正片」的，是正片本身：交给用户的正片订阅，插件不碰。
+        # 只清衍生标记是不够的——正片也有季号、期号、分P、片段名，拿去落位会
+        # 稳稳命中同期的衍生集（第6期上正片撞上第6期上纯享），结果正片被插件
+        # 从订阅里抢走，还改名塞进 Season 00，正片那一集反而缺了。
+        if parsed.is_feature:
+            if feature_filtered is not None:
+                feature_filtered.append(title)
             continue
         is_derived = parsed.subtype is not None
         # 用户关掉的类型（例如直拍）连解析后的落位都不做，直接排除。
@@ -600,7 +610,11 @@ def _source_order(candidate: Candidate) -> tuple:
     )
 
 
-def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[tuple[Candidate, str]]]:
+def assign_episodes(
+    candidates: list[Candidate],
+    skip_subtypes: Optional[list[str]] = None,
+    type_blocked: Optional[list[str]] = None,
+) -> tuple[list[Candidate], list[tuple[Candidate, str]]]:
     """给每条资源分配互不相同的特别集号。
 
     TMDB 把同一期的正片、加更、多个纯享片段拆成多集（如 163/164/165 是同一期的
@@ -611,11 +625,18 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
     1. 同一份内容（同站点序号、或同名片段）的多个版本归为一组，整组落到同一集；
     2. 组按站点发布顺序依次挑分最高、且尚未被占用的集号；
     3. 一个集号只给一组，宁可让多出来的资源「等待」，也不重复落位。
+
+    :param skip_subtypes: 用户关掉的衍生类型。除了按资源名挡一遍，落位时还要
+        按「目标集自己的类型」再挡一遍：站点常只写期号加片段名
+        （「第6期上·笨蛋杀手」），资源名里根本没有「纯享」二字，
+        光看资源名判断类型，关掉的类型照样会被下下来。
+    :param type_blocked: 非空时，把因落位目标是关掉的类型而排除的标题写进去。
     """
     ordered = sorted(_group_candidates(candidates), key=lambda items: _source_order(items[0]))
     used: set[int] = set()
     chosen: list[Candidate] = []
     skipped: list[tuple[Candidate, str]] = []
+    blocked_types = {item for item in (skip_subtypes or []) if item}
 
     for items in ordered:
         want = items[0].parsed.subtype
@@ -627,6 +648,7 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
 
         pick: Optional[MatchResult] = None
         blocked_untyped = False
+        blocked_labels: list[str] = []
         seen: set[int] = set()
         for option in pool:
             if option.episode in seen:
@@ -634,6 +656,13 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
             seen.add(option.episode)
             # 类型对不上的集不占：加更占掉直拍那一集，刮削就全乱了
             if not subtypes_compatible(want, option.subtype):
+                continue
+            # 用户关掉的是「这类集」，不是「带这类词的种子名」。站点经常只写
+            # 期号加片段名，等落位才知道目标是纯享集；只看资源名，这一集照样会下。
+            if option.subtype in blocked_types:
+                label = SUBTYPE_LABELS.get(option.subtype, option.subtype)
+                if label not in blocked_labels:
+                    blocked_labels.append(label)
                 continue
             # 类型没识别出来时不能「分高就落」：词表追不上站点的叫法，
             # 遇到没见过的写法（未删减版、案情回顾、坞民日记……）就当成
@@ -650,7 +679,11 @@ def assign_episodes(candidates: list[Candidate]) -> tuple[list[Candidate], list[
             break
 
         if pick is None:
-            if blocked_untyped:
+            if blocked_labels:
+                reason = f'落位目标是「{"、".join(blocked_labels)}」集，按设置不下载'
+                if type_blocked is not None:
+                    type_blocked.extend(item.title for item in items)
+            elif blocked_untyped:
                 reason = '这条资源的衍生类型没能识别，为避免刮错先不落位'
             elif any(not subtypes_compatible(want, option.subtype) for option in pool):
                 reason = '没有类型相符的特别集可落位，本轮先不处理'
@@ -795,6 +828,7 @@ def scan_show(
 
     season_filtered: list[str] = []
     type_filtered: list[str] = []
+    feature_filtered: list[str] = []
     candidates, report.derived_found, report.matched, unmatched = build_candidates(
         contexts,
         show,
@@ -802,6 +836,7 @@ def scan_show(
         season_filtered=season_filtered,
         skip_subtypes=options.skip_subtypes,
         type_filtered=type_filtered,
+        feature_filtered=feature_filtered,
     )
 
     # 这批资源已经在 TMDB 里找到了对应集，之前挂在「等待补齐」里的记录要撤掉，
@@ -858,7 +893,13 @@ def scan_show(
     eligible = fresh
 
     # 多条资源撞同一集时按发布顺序重新分配，保证一条资源落一个集号
-    candidates, assign_skipped = assign_episodes(eligible)
+    landing_blocked: list[str] = []
+    candidates, assign_skipped = assign_episodes(
+        eligible,
+        skip_subtypes=options.skip_subtypes,
+        type_blocked=landing_blocked,
+    )
+    type_filtered.extend(landing_blocked)
 
     # 扫到了衍生内容但 TMDB 特别季里没有登记：记录下来等下一轮，不静默丢弃
     head_lines: list[str] = []
@@ -916,6 +957,11 @@ def scan_show(
             SUBTYPE_LABELS.get(item, item) for item in options.skip_subtypes if item
         )
         head_lines.append(f'已按设置跳过「{labels}」{len(type_filtered)} 条')
+
+    if feature_filtered:
+        head_lines.append(
+            f'{len(feature_filtered)} 条副标题标了「正片」，交给正片订阅处理，插件只下衍生内容'
+        )
 
     chosen, skipped, _winners = plan_tasks(candidates, store, show, options)
     skipped.extend(assign_skipped)

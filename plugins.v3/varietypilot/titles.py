@@ -276,6 +276,8 @@ class ParsedTitle:
     # 片段名，如「小画家」「白敬亭林一雷霆画功」，用于区分同期的多个纯享片段
     segment: Optional[str] = None
     signals: list[str] = field(default_factory=list)
+    # 副标题明确标了「正片」：这是正片本身，不是衍生内容，插件不参与
+    is_feature: bool = False
 
     @property
     def episode_is_site_ordinal(self) -> bool:
@@ -527,6 +529,11 @@ def parse_release(title: str, description: str = '') -> ParsedTitle:
         parsed.subtype = None
         parsed.subtype_word = None
         parsed.modifier = None
+        # 光清衍生标记不够：正片同样带季号、期号、分P、片段名，
+        # 拿去做落位计算会稳稳命中同期的衍生集（第6期上正片撞第6期上纯享），
+        # 于是正片被插件下走、塞进 Season 00。这里必须留下明确的「是正片」标记，
+        # 由扫描链路整条排除。
+        parsed.is_feature = True
         parsed.signals.append('副标题:正片')
 
     # 「毛雪汪 S01E02 Special」这类一次性特别内容没有期号概念，
